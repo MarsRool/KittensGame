@@ -9,9 +9,14 @@
 // @match        http*://kittensgame.com/alpha/
 // @grant        none
 // ==/UserScript==
-window.addEventListener("load", function() {
+function loadScriptKitties() {
     var script=document.createElement('script');
     script.src='https://cdn.jsdelivr.net/gh/MarsRool/KittensGame/ScriptKitties.js';
     script.id='SK_origin';
     document.body.appendChild(script);
-}, false);
+}
+if (document.readyState === "complete") {
+    loadScriptKitties();
+} else {
+    window.addEventListener("load", loadScriptKitties, {once: true});
+}

@@ -62,15 +62,23 @@ var SK = class {
         if (dataString) {
             try {
                 var options = JSON.parse(dataString);
+                if (!options || typeof options !== 'object' || Array.isArray(options)) {
+                    throw new Error('Invalid ScriptKitties settings');
+                }
             } catch (ex) {
                 console.error('Unable to load game data: ', ex);
                 console.log(dataString);
                 game.msg('Unable to load script settings. Settings were logged to console.', 'important');
-                delete(LCstorage['net.sagefault.ScriptKittens.loaddata']);
-                game.msg('Settings deleted.');
+                delete(LCstorage['net.sagefault.ScriptKittens.savedata']);
+                game.msg('Invalid settings deleted.');
+                return;
             }
             this.model.load(options);
             this.scripts.load(options);
+            // Never resume full autoplay or reset permission just from saved settings.
+            this.model.auto.play = false;
+            this.model.minor.permitReset = false;
+            this.scripts.init();
             this.gui.refresh();
         }
     }
@@ -166,8 +174,20 @@ SK.Model = class {
     }
 
     load(options) {
-        for (const key of ['auto', 'minor', 'option', 'cathBuildings', 'spaceBuildings', 'timeBuildings']) {
-            if (options[key]) this[key] = options[key];
+        for (const key of ['auto', 'minor', 'option']) {
+            if (options[key] && typeof options[key] === 'object' && !Array.isArray(options[key])) {
+                Object.assign(this[key], options[key]);
+            }
+        }
+        // Keep new buildings disabled even when loading old saved selections.
+        for (const key of ['cathBuildings', 'spaceBuildings', 'timeBuildings']) {
+            const saved = options[key];
+            if (!saved || typeof saved !== 'object' || Array.isArray(saved)) continue;
+            for (const name in this[key]) {
+                if (!saved[name] || typeof saved[name] !== 'object') continue;
+                this[key][name].enabled = Boolean(saved[name].enabled);
+                if ('limit' in saved[name]) this[key][name].limit = saved[name].limit;
+            }
         }
     }
 
@@ -674,7 +694,7 @@ SK.Tasks = class {
 
             console.log(`pre-trade crafting away ${amount} ${resource.name} into ${craft.name}`); // XXX remove
             // over-specify here to prevent infinite loops. Address in the unlikely case it ever matters
-            if (resource.name=='catnip' && craft.name=='wood') this.makeSpace('wood', craftCount);
+            if (resource.name === 'catnip' && craft.name === 'wood') this.makeSpace(game.resPool.get('wood'), craftCount);
             game.craft(craft.name, craftCount);
             break;
         }
@@ -711,7 +731,7 @@ SK.Tasks = class {
             for (var button of sk.bldTabChildren()) {
                 if (! button.model.metadata) continue;
                 const name = button.model.metadata.name;
-                if (button.model.enabled && cb[name].enabled
+                if (button.model.enabled && cb[name]?.enabled
                         && (!cb[name].limit || button.model.metadata.val < cb[name].limit)) {
                     if (this.buyItem(button)) built = true;
                 }
@@ -881,7 +901,7 @@ SK.Tasks = class {
             const sb = this.model.spaceBuildings;
             for (const planet of game.spaceTab.planetPanels) {
                 for (var spBuild of planet.children) {
-                    if (sb[spBuild.id].enabled && game.space.getBuilding(spBuild.id).unlocked
+                    if (sb[spBuild.id]?.enabled && game.space.getBuilding(spBuild.id).unlocked
                             && (!sb[spBuild.id].limit || spBuild.model.metadata.val < sb[spBuild.id].limit)) {
                         // .enabled doesn't update automatically unless the tab is active, force it
                         if (! spBuild.model.enabled) spBuild.controller.updateEnabled(spBuild.model);
@@ -1327,6 +1347,41 @@ SK.Tasks = class {
         return built;
     }
 
+    // Estimate normal trade yields without changing RNG, diplomacy state, stats or Undo.
+    // This is an expectation, not an exact preview of random/rare trade outcomes.
+    estimateTradeResources(race, trades) {
+        const diplomacy = game.diplomacy;
+        const standing = diplomacy.getFinalStanding(race);
+        const successRatio = Math.max(0, Math.min(1, 1 + Math.min(standing, 0)));
+        const bonusRatio = Math.max(0, Math.min(1, standing));
+        const tradeRatio = 1 + diplomacy.getTradeRatio()
+            + diplomacy.calculateTradeBonusFromPolicies(race.name, game)
+            + game.challenges.getChallenge('pacifism').getTradeBonusEffect(game);
+        const tradeVolume = diplomacy.getTradeVolume();
+        const raceRatio = 1 + race.energy * 0.02;
+        const currentSeason = game.calendar.getCurSeason().name;
+        const result = {};
+
+        for (const sale of race.sells) {
+            const chance = Math.max(0, Math.min(1, diplomacy.getResourceTradeChance(sale, race)));
+            if (!chance) continue;
+            const seasonRatio = 1 + (sale.seasons?.[currentSeason] || 0);
+            result[sale.name] = trades * successRatio * chance * (1 + 0.25 * bonusRatio)
+                * sale.value * tradeRatio * tradeVolume * raceRatio * seasonRatio;
+        }
+
+        if (race.name === 'zebras') {
+            const ships = game.resPool.get('ship').value;
+            const relationBonus = game.getEffect('zebraRelationModifier')
+                * game.bld.getBuildingExt('tradepost').meta.effects.tradeRatio;
+            const titaniumChance = Math.min(1, 0.15 + ships * 0.0035);
+            result.titanium = trades * successRatio * (1.5 + ships * 0.03)
+                * (1 + relationBonus) * tradeVolume * titaniumChance;
+        }
+
+        return result;
+    }
+
     // Trade automatically
     autoTrade(ticksPerCycle, consecutive) {
         let traded = false;
@@ -1339,8 +1394,9 @@ SK.Tasks = class {
             const powerCost = game.diplomacy.getManpowerCost();
 
             let tradeLimit = 10000; // upper bound
-            if (goldCost) tradeLimit = Math.min(tradeLimit, goldPerCycle, goldResource.value / goldCost);
-            if (powerCost) tradeLimit = Math.min(tradeLimit, powerPerCycle, powerResource.value / powerCost);
+            if (goldCost) tradeLimit = Math.min(tradeLimit, goldPerCycle / goldCost, goldResource.value / goldCost);
+            if (powerCost) tradeLimit = Math.min(tradeLimit, powerPerCycle / powerCost, powerResource.value / powerCost);
+            tradeLimit = Math.max(0, Math.floor(tradeLimit));
 
             // Always check catnip, if it's lower than 10%, trade with sharks
             if (tradeLimit > 0 && this.model.minor.lowCatnipTrade) {
@@ -1348,22 +1404,15 @@ SK.Tasks = class {
                 if (sharks.unlocked) {
                     const catnipResource = game.resPool.get('catnip');
                     if (catnipResource.value < catnipResource.maxValue * 0.1) {
-                        const sharksCellCatnip = sharks.sells.find((s) => s.name === 'catnip');
-
-                        const currentSeason = game.calendar.season;
-                        let catnipCoefficient = 1;
-                        if (sharksCellCatnip.seasons && sharksCellCatnip.seasons[currentSeason]) {
-                            catnipCoefficient += sharksCellCatnip.seasons[currentSeason];
-                        }
-                        catnipCoefficient += 1.03 + game.getEffect("tradeRatio") + game.prestige.getBurnedParagonRatio() * 0.03;
-
-                        const desiredTradeCatnipValue = catnipResource.maxValue * 0.8;
-                        const sharksCellCatnipValue = sharksCellCatnip.value * catnipCoefficient;
-                        let catnipTradeLimit = Math.min(tradeLimit, Math.ceil(desiredTradeCatnipValue / sharksCellCatnipValue));
-
+                        const expectedCatnip = this.estimateTradeResources(sharks, 1).catnip || 0;
+                        const desiredCatnip = Math.max(0, catnipResource.maxValue * 0.8 - catnipResource.value);
                         const ironRes = game.resPool.get('iron');
-                        const sharksTradeCost = sharks.buys.find((b) => b.name === 'iron').val;
-                        catnipTradeLimit = Math.min(catnipTradeLimit, Math.floor(ironRes.value / sharksTradeCost));
+                        const ironCost = sharks.buys.find((b) => b.name === 'iron')?.val;
+                        const tradeVolume = game.diplomacy.getTradeVolume();
+                        let catnipTradeLimit = expectedCatnip > 0 && ironCost > 0
+                            ? Math.min(tradeLimit, Math.ceil(desiredCatnip / expectedCatnip),
+                                Math.floor(ironRes.value / (ironCost * tradeVolume)))
+                            : 0;
 
                         if (catnipTradeLimit > 0) {
                             game.diplomacy.tradeMultiple(sharks, catnipTradeLimit);
@@ -1403,15 +1452,14 @@ SK.Tasks = class {
                     // 50% basis, and then limit it down to the gold/catpower
                     // limit above afterward, when we are decided how many to
                     // send.
-                    const trades = Math.min(Math.ceil(game.diplomacy.getMaxTradeAmt(race) * spend), tradeLimit);
+                    const trades = Math.min(Math.ceil((game.diplomacy.getMaxTradeAmt(race) || 0) * spend), tradeLimit);
                     if (! trades || trades <= 1) continue; // no single trades
 
-                    const duration = race.duration; // preserve against tradeImpl side effects
-                    const expectedResources = game.diplomacy.tradeImpl(race, trades);
-                    race.duration = duration;
+                    const expectedResources = this.estimateTradeResources(race, trades);
                     for (const resName in expectedResources) {
                         const res = game.resPool.get(resName);
-                        const ratio = Math.min(expectedResources[resName], res.maxValue - res.value) / res.value;
+                        if (!res || !(res.maxValue > 0)) continue;
+                        const ratio = Math.min(expectedResources[resName], res.maxValue - res.value) / Math.max(1, res.value);
                         if (ratio > best.ratio) {
                             best = {race:race, ratio:ratio, trades:trades, res:expectedResources};
                         }
@@ -2997,7 +3045,9 @@ SK.Scripts = class {
 };
 
 var sk;
-if (game && game.bld) {
+if (sk) {
+    console.warn('ScriptKitties is already loaded; ignoring duplicate injection.');
+} else if (typeof game !== 'undefined' && game && game.bld) {
     sk = new SK();
 } else { // we were loaded before the game was, wait for it.
     dojo.subscribe('game/start', function() {
