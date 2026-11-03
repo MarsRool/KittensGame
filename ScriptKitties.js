@@ -293,8 +293,8 @@ SK.Gui = class {
             [this.autoButton('Check Efficiency', 'sk.tasks.kittenEfficiency()'), this.autoButton('Minor Options', '$(\'#SK_minorOptions\').toggle();')],
             [this.autoSwitchButton('Auto Build', 'build'), this.autoButton('Select Building', '$(\'#SK_buildingOptions\').toggle();')],
             [this.autoSwitchButton('Auto Assign', 'assign'), this.autoDropdown('assign', ['smart'], game.village.jobs)],
-            [this.autoSwitchButton('Auto Craft', 'craft'), this.autoDropdown('book', ['default'].concat(this.model.books), [])],
-            [this.autoDropdown('coreAlloy', ['default'].concat(this.model.coreAlloys), [])],
+            [this.autoSwitchButton('Auto Craft', 'craft'), this.autoDropdown('book', ['default', 'auto'].concat(this.model.books), [])],
+            [this.autoDropdown('coreAlloy', ['default', 'auto'].concat(this.model.coreAlloys), [])],
             ['<label style="{{grid}}">Secondary Craft %</label>',
                 `<span style="display:flex; justify-content:space-around; {{grid}}" title="Between 0 and 100">`
                 + `<label>min:</label><input id="SK_minSRS" type="text" style="width:25px" onchange="sk.model.option.minSecResRatio=this.value" value="${this.model.option.minSecResRatio}">`
@@ -547,8 +547,15 @@ SK.Tasks = class {
     taskRunner() {
         if (game.isPaused) return; // we pause too
         const ticks = game.timer.ticksTotal;
+        const previous = this.lastScheduledTick === undefined || ticks < this.lastScheduledTick
+            ? ticks - 1 : this.lastScheduledTick;
+        this.lastScheduledTick = ticks;
         for (const task of this.schedule) {
-            if (task.override || ticks % task.interval === task.offset) {
+            // Run once when the scheduled tick was crossed, even if the browser
+            // delayed our timer callback while this tab was in the background.
+            const due = Math.floor((ticks - task.offset) / task.interval)
+                > Math.floor((previous - task.offset) / task.interval);
+            if (task.override || due) {
                 task.override = this[task.fn](task.interval, task.override);
             }
         }
@@ -761,105 +768,158 @@ SK.Tasks = class {
 
     /*** These scripts run every three ticks ***/
 
-    // Craft primary resources automatically
-    autoCraft(ticksPerCycle) {
-        /* Note: In this function, rounding gives us grief.
-         * If we have enough resource to craft 3.75 of of something, and ask for
-         * that, the game rounds up to 4 and then fails because we don't have
-         * enough.
-         *
-         * However, we mostly craft "off the top", making space for production,
-         * so we'll usually have the slack. But when we don't, it effectively turns
-         * off autoCraft for that resource.
-         *
-         * On the other hand, we don't want to always round down, or else we'll be
-         * wasting resources, and in some cases *cough*eludium*cough*, we'll be
-         * rounding down to zero.
-         *
-         * Note: There are problems with some crafts starving later crafts.
-         * This is fine for things that use SRS, because percentages, but for
-         * plates and steel it's a problem. To avoid that we treat "iron" special.
-         */
+    // Build bounded craft goals from currently unlocked, unresearched techs.
+    // A missing advanced material also reserves the intermediates required to make it.
+    autoCraftGoals(chain, includeScience) {
+        const candidates = [];
+        if (includeScience && this.model.auto.research) {
+            candidates.push(...game.science.techs);
+        }
+        if (this.model.auto.workshop) {
+            candidates.push(...game.workshop.upgrades);
+        }
 
-        let ironCache = null;
-        if (this.model.auto.craft && game.workshopTab.visible) {
-            for (const res of game.workshop.crafts) {
-                const output = res.name;
-                const inputs = res.prices;
-                const outRes = game.resPool.get(output);
-                if (! res.unlocked) continue;
-                if (outRes.type !== 'common') continue; // mostly to prevent relic+tc->bloodstone
+        const direct = Object.fromEntries(chain.map((name) => [name, 0]));
+        let hasDemand = false;
+        for (const tech of candidates) {
+            if (!tech.unlocked || tech.researched || tech.blocked) continue;
+            const prices = tech.prices || [];
+            if (this.model.minor.conserveExotic &&
+                    prices.some((price) => this.model.exoticResources.includes(price.name))) continue;
 
-                // Paragon Farm must not convert stored Unobtainium or other
-                // resource reserves into crafted outputs (notably Eludium).
-                if (this.model.auto.play && this.model.option.script === 'paragonFarm'
-                    && inputs.some((p) => this.model.exoticResources.includes(p.name))) continue;
-                let craftCount = Infinity;
-                let minimumReserve = Infinity;
-                for (const input of inputs) {
-                    const inRes = game.resPool.get(input.name);
-                    const outVal = outRes.value / (1 + game.getCraftRatio(outRes.tag));
-                    const inVal = inRes.value / input.val;
-                    craftCount = Math.min(craftCount, Math.floor(inVal)); // never try to use more than we have
-                    // for when our capacity gets large compared to production
-                    minimumReserve = Math.min(minimumReserve, inVal * (this.model.option.minSecResRatio / 100) - outVal);
+            for (const price of prices) {
+                if (!Object.prototype.hasOwnProperty.call(direct, price.name)) continue;
+                direct[price.name] = Math.max(direct[price.name], price.val);
+                hasDemand = true;
+            }
+        }
+        if (!hasDemand) return null; // No relevant tech: use ordinary ratio-based crafting.
 
-                    if (this.model.coreAlloys.includes(output) && this.model.option.coreAlloy !== 'default') {
-                        // secondary resource: coal, iron, titanium, steel, unobtainium, alloy
-                        const outputIndex = this.model.coreAlloys.indexOf(output);
-                        const choiceIndex = this.model.coreAlloys.indexOf(this.model.option.coreAlloy);
-                        if (outputIndex > choiceIndex) {
-                            craftCount = 0;
-                            minimumReserve = 0;
-                            break;
-                        }
-                    } else if (this.model.books.includes(output) && this.model.option.book !== 'default') {
-                        // secondary resource: fur, parchment, manuscript, compendium
-                        const outputIndex = this.model.books.indexOf(output);
-                        const choiceIndex = this.model.books.indexOf(this.model.option.book);
-                        if (outputIndex > choiceIndex) {
-                            craftCount = 0;
-                            minimumReserve = 0;
-                            break;
-                        }
-                    } else if (inRes.maxValue) {
-                        // primary resource
-                        const resourcePerCycle = game.getResourcePerTick(input.name, 0) * ticksPerCycle;
-                        let surplus = inRes.value + resourcePerCycle - inRes.maxValue;
-                        if (inRes.name === "iron") {
-                            if (ironCache === null) ironCache = surplus;
-                            else surplus = ironCache;
-                        }
-                        if (0 < surplus && surplus < resourcePerCycle * 2) {
-                            craftCount = Math.min(craftCount, surplus / input.val);
-                        } else {
-                            craftCount = 0;
-                        }
-                    } else {
-                        // secondary resource: general
-                        const targetValue = (inVal + outVal) * (this.model.option.maxSecResRatio / 100);
-                        if (outVal >= targetValue) {
-                            craftCount = 0;
-                        } else {
-                            craftCount = Math.min(craftCount, targetValue - outVal);
-                        }
-                    }
-                }
-
-                craftCount = Math.max(craftCount, minimumReserve);
-                if (craftCount === 0 || craftCount === Infinity) {
-                    // nothing to do, or no reason to act
-                } else if (this.model.option.book === 'blueprint' && output === 'compedium' && game.resPool.get('compedium').value > 25) {
-                    // save science for making blueprints
-                } else {
-                    if (res.maxValue) this.makeSpace(res, craftCount);
-                    game.craft(output, craftCount);
+        const goals = {...direct};
+        // Work backwards so a Blueprint shortage also creates bounded goals for
+        // Compendiums, Manuscripts and Parchment, rather than infinitely crafting all.
+        for (let i = chain.length - 1; i > 0; --i) {
+            const name = chain[i];
+            const recipe = game.workshop.getCraft(name);
+            if (!recipe || !recipe.unlocked) continue;
+            const shortage = Math.max(0, goals[name] - game.resPool.get(name).value);
+            if (!shortage) continue;
+            const yieldPerCraft = Math.max(1, 1 + game.getResCraftRatio(name));
+            const batches = Math.ceil(shortage / yieldPerCraft);
+            for (const price of recipe.prices) {
+                if (Object.prototype.hasOwnProperty.call(goals, price.name)) {
+                    goals[price.name] += batches * price.val;
                 }
             }
         }
-        return false; // we scale action to need, re-run never required
+        return {goals, direct};
     }
 
+    // Craft primary and secondary resources automatically.
+    autoCraft(ticksPerCycle) {
+        if (!this.model.auto.craft || !game.workshopTab.visible) return false;
+
+        const bookGoals = this.model.option.book === 'auto'
+            ? this.autoCraftGoals(this.model.books, true) : null;
+        const alloyGoals = this.model.option.coreAlloy === 'auto'
+            ? this.autoCraftGoals(this.model.coreAlloys, false) : null;
+        let ironCache = null;
+
+        for (const craft of game.workshop.crafts) {
+            const output = craft.name;
+            const outRes = game.resPool.get(output);
+            if (!craft.unlocked || outRes.type !== 'common') continue;
+
+            // The Paragon farmer must never consume resources carried across resets.
+            if (this.model.auto.play && this.model.option.script === 'paragonFarm' &&
+                    craft.prices.some((price) => this.model.exoticResources.includes(price.name))) continue;
+
+            const isBook = this.model.books.includes(output);
+            const isAlloy = this.model.coreAlloys.includes(output);
+            const goals = isBook ? bookGoals : isAlloy ? alloyGoals : null;
+            const selected = isBook ? this.model.option.book : isAlloy ? this.model.option.coreAlloy : 'default';
+            const yieldPerCraft = Math.max(1, 1 + game.getResCraftRatio(output));
+            const neededBatches = goals
+                ? Math.ceil(Math.max(0, goals.goals[output] - outRes.value) / yieldPerCraft)
+                : Infinity;
+            if (neededBatches === 0) continue;
+
+            // Manual priority modes continue to work as before.
+            if (selected !== 'default' && selected !== 'auto') {
+                const chain = isBook ? this.model.books : this.model.coreAlloys;
+                if (chain.indexOf(output) > chain.indexOf(selected)) continue;
+            }
+
+            let craftCount = Infinity;
+            let minimumReserve = Infinity;
+            for (const input of craft.prices) {
+                const inRes = game.resPool.get(input.name);
+                const inVal = inRes.value / input.val;
+                const outVal = outRes.value / yieldPerCraft;
+                craftCount = Math.min(craftCount, Math.floor(inVal));
+
+                if (goals) {
+                    // Keep material directly requested by another tech intact while
+                    // using only the extra amount for a higher-tier craft.
+                    const reserve = goals.direct[input.name] || 0;
+                    craftCount = Math.min(craftCount,
+                        Math.floor(Math.max(0, inRes.value - reserve) / input.val));
+                    continue;
+                }
+
+                minimumReserve = Math.min(minimumReserve,
+                    inVal * (this.model.option.minSecResRatio / 100) - outVal);
+
+                if (selected !== 'default' && selected !== 'auto') {
+                    // Explicit priority modes intentionally craft from available stock.
+                    continue;
+                }
+                if (inRes.maxValue) {
+                    const resourcePerCycle = game.getResourcePerTick(input.name, 0) * ticksPerCycle;
+                    let surplus = inRes.value + resourcePerCycle - inRes.maxValue;
+                    if (inRes.name === 'iron') {
+                        if (ironCache === null) ironCache = surplus;
+                        else surplus = ironCache;
+                    }
+                    // A resource already over its cap must not disable crafting.
+                    // The old upper-bound check incorrectly discarded large surpluses.
+                    if (surplus > 0) {
+                        craftCount = Math.min(craftCount, surplus / input.val);
+                    } else {
+                        craftCount = 0;
+                    }
+                } else {
+                    const targetValue = (inVal + outVal) * (this.model.option.maxSecResRatio / 100);
+                    if (outVal >= targetValue) {
+                        craftCount = 0;
+                    } else {
+                        craftCount = Math.min(craftCount, targetValue - outVal);
+                    }
+                }
+            }
+
+            if (goals) {
+                // Never exceed the demand implied by pending science/upgrades.
+                craftCount = Math.min(craftCount, neededBatches);
+            } else {
+                craftCount = Math.max(craftCount, minimumReserve);
+            }
+            if (!(craftCount > 0) || !Number.isFinite(craftCount)) continue;
+
+            if (selected === 'blueprint' && output === 'compedium' &&
+                    game.resPool.get('compedium').value > 25) continue;
+
+            // The game's craft() rounds batch counts up. Clamp to available
+            // ingredients before passing it a count to avoid failed crafts.
+            const available = Math.min(...craft.prices.map((price) =>
+                Math.floor(game.resPool.get(price.name).value / price.val)));
+            const batches = Math.min(Math.ceil(craftCount), available);
+            if (batches <= 0) continue;
+            if (craft.maxValue) this.makeSpace(outRes, batches);
+            game.craft(output, batches);
+        }
+        return false;
+    }
     // Collection of Minor Auto Tasks
     autoMinor(ticksPerCycle) {
         let override = false;
