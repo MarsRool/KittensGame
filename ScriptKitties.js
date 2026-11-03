@@ -75,10 +75,22 @@ var SK = class {
             }
             this.model.load(options);
             this.scripts.load(options);
-            // Never resume full autoplay or reset permission just from saved settings.
-            this.model.auto.play = false;
-            this.model.minor.permitReset = false;
-            this.scripts.init();
+            // Only the explicitly selected Paragon Farm may resume after reload.
+            // Both Auto Play and the reset permission retain their independent opt-ins.
+            const resumeFarm = options.option?.script === 'paragonFarm'
+                && options.auto?.play === true;
+            if (!resumeFarm) {
+                this.model.auto.play = false;
+                this.model.minor.permitReset = false;
+                this.scripts.init();
+            } else {
+                this.model.auto.play = true;
+                this.model.minor.permitReset = options.minor?.permitReset === true;
+                // Stop dangerous tasks before their first timer tick.
+                for (const name of ['cycle', 'shatter', 'bcoin', 'flux', 'trade', 'unicorn']) {
+                    this.model.auto[name] = false;
+                }
+            }
             this.gui.refresh();
         }
     }
@@ -129,6 +141,10 @@ SK.Model = class {
             'relic',
             'temporalFlux', // honorary
             'void',
+            // Resources that survive ordinary resets or are used to develop
+            // preserved progression must also be protected by Conserve Exotic.
+            'timeCrystal', 'unobtainium', 'eludium', 'necrocorn',
+            'sorrow', 'paragon', 'burnedParagon', 'karma',
         ];
 
         this.setDefaults();
@@ -731,7 +747,9 @@ SK.Tasks = class {
             for (var button of sk.bldTabChildren()) {
                 if (! button.model.metadata) continue;
                 const name = button.model.metadata.name;
-                if (button.model.enabled && cb[name]?.enabled
+                const protectedCost = this.model.auto.play && this.model.option.script === 'paragonFarm'
+                    && (button.model.prices || []).some((p) => this.model.exoticResources.includes(p.name));
+                if (button.model.enabled && !protectedCost && cb[name]?.enabled
                         && (!cb[name].limit || button.model.metadata.val < cb[name].limit)) {
                     if (this.buyItem(button)) built = true;
                 }
@@ -772,6 +790,10 @@ SK.Tasks = class {
                 if (! res.unlocked) continue;
                 if (outRes.type !== 'common') continue; // mostly to prevent relic+tc->bloodstone
 
+                // Paragon Farm must not convert stored Unobtainium or other
+                // resource reserves into crafted outputs (notably Eludium).
+                if (this.model.auto.play && this.model.option.script === 'paragonFarm'
+                    && inputs.some((p) => this.model.exoticResources.includes(p.name))) continue;
                 let craftCount = Infinity;
                 let minimumReserve = Infinity;
                 for (const input of inputs) {
@@ -901,7 +923,9 @@ SK.Tasks = class {
             const sb = this.model.spaceBuildings;
             for (const planet of game.spaceTab.planetPanels) {
                 for (var spBuild of planet.children) {
-                    if (sb[spBuild.id]?.enabled && game.space.getBuilding(spBuild.id).unlocked
+                    const protectedCost = this.model.auto.play && this.model.option.script === 'paragonFarm'
+                        && (spBuild.model.prices || []).some((p) => this.model.exoticResources.includes(p.name));
+                    if (!protectedCost && sb[spBuild.id]?.enabled && game.space.getBuilding(spBuild.id).unlocked
                             && (!sb[spBuild.id].limit || spBuild.model.metadata.val < sb[spBuild.id].limit)) {
                         // .enabled doesn't update automatically unless the tab is active, force it
                         if (! spBuild.model.enabled) spBuild.controller.updateEnabled(spBuild.model);
@@ -953,7 +977,9 @@ SK.Tasks = class {
             for (const buttons of buttonGroups) {
                 if (buttons) {
                     for (const button of buttons) {
-                        if (tb[button.id]?.enabled && button.model?.metadata?.unlocked
+                        const protectedCost = this.model.auto.play && this.model.option.script === 'paragonFarm'
+                            && (button.model?.prices || []).some((p) => this.model.exoticResources.includes(p.name));
+                        if (!protectedCost && tb[button.id]?.enabled && button.model?.metadata?.unlocked
                                 && (!tb[button.id].limit || button.model.metadata.val < tb[button.id].limit)) {
                             if (! button.model.enabled) button.controller.updateEnabled(button.model);
                             if (button.model.enabled) {
@@ -1385,7 +1411,8 @@ SK.Tasks = class {
     // Trade automatically
     autoTrade(ticksPerCycle, consecutive) {
         let traded = false;
-        if (this.model.auto.trade && game.diplomacyTab.visible) {
+        if (this.model.auto.trade && game.diplomacyTab.visible
+                && !(this.model.auto.play && this.model.option.script === 'paragonFarm')) {
             const goldResource = game.resPool.get('gold');
             const goldPerCycle = game.getResourcePerTick('gold') * ticksPerCycle;
             const goldCost = game.diplomacy.getGoldCost();
@@ -1794,21 +1821,28 @@ SK.Scripts = class {
 
     init() {
         this.state = ['init'];
+        this.farmState = null;
     }
 
     save(options) {
         options.scripts_state = this.state;
+        options.paragonFarmState = this.farmState;
     }
 
     load(options) {
         if (options.scripts_state) this.state = options.scripts_state;
+        if (options.paragonFarmState && typeof options.paragonFarmState === 'object'
+                && Number.isFinite(options.paragonFarmState.startedAt)) {
+            this.farmState = options.paragonFarmState;
+        }
     }
 
 
     static listScripts() {
         return [ // format is chosen to match things like game.calendar.cycles
             {name:'test',        title:'Test Script'},
-            {name:'fastParagon', title:'Fast Paragon'},
+            {name:'paragonFarm', title:'Safe Paragon Farm'},
+            {name:'fastParagon', title:'Fast Paragon (legacy)'},
             {name:'slowloop',    title:'DF ChronoExpo'},
             {name:'fastloop',    title:'Short ChronoExpo'},
             {name:'hoglaHunt',   title:'Hoglagame - Hunt'},
@@ -1820,6 +1854,8 @@ SK.Scripts = class {
     }
 
     run(script) {
+        // This strategy never intercepts arbitrary game confirmation dialogs.
+        if (script === 'paragonFarm') return this.paragonFarm();
         if (this.state.length === 0) return;
 
         // prep
@@ -3014,6 +3050,183 @@ SK.Scripts = class {
                 game.msg(`CRITICAL: unrecognized state ${action}`);
                 return true; // to cause refresh
         }
+    }
+
+    // Paragon farming deliberately never uses old Auto Play state machines.
+    // Only explicitly whitelisted buildings and resource-safe automation are enabled.
+    paragonFarm() {
+        if (!this.model.auto.play || this.model.option.script !== 'paragonFarm') return false;
+
+        const isChallenge = game.challenges?.challenges?.some((challenge) => challenge.active || challenge.pending);
+        if (isChallenge || game.ironWill) {
+            this.model.auto.play = false;
+            game.msg('Paragon Farm stopped: challenge or Iron Will is active.', 'important');
+            sk.gui.refresh();
+            sk.saveOptions();
+            return false;
+        }
+
+        // The scripts and their selection data may have been loaded from a save.
+        // Reassert restrictions every cycle, including after a browser reload.
+        const protectedResources = [
+            'timeCrystal', 'relic', 'void', 'antimatter', 'unobtainium',
+            'eludium', 'blackcoin', 'bloodstone', 'necrocorn', 'sorrow',
+            'temporalFlux', 'paragon', 'burnedParagon', 'karma'
+        ];
+        for (const name of protectedResources) {
+            if (!this.model.exoticResources.includes(name)) this.model.exoticResources.push(name);
+        }
+        this.model.minor.conserveExotic = true;
+        this.model.minor.elderTrade = false;
+        this.model.minor.feed = false;
+        this.model.minor.program = false;
+        this.model.minor.autoFixCC = false;
+        this.model.minor.praiseAfter = false;
+        this.model.auto.cycle = false;
+        this.model.auto.shatter = false;
+        this.model.auto.bcoin = false;
+        this.model.auto.flux = false;
+        game.time.isAccelerated = false; // Do not consume stored Temporal Flux.
+        this.model.auto.trade = false; // Trade only with zebras, explicitly, below.
+        this.model.auto.unicorn = false;
+        this.model.auto.religion = false;
+        this.model.auto.energy = false;
+
+        const now = Date.now();
+        const prestige = game.getResetPrestige().paragonPoints;
+        const kittens = game.resPool.get('kittens');
+        const maxKittens = kittens.maxValue || 0;
+        if (!this.farmState || !Number.isFinite(this.farmState.startedAt) || !this.farmState.startedAt) {
+            this.farmState = {
+                startedAt: now, sampleAt: now, sampleParagon: prestige,
+                startingParagon: prestige, lastCapGrowthAt: now, lastCap: maxKittens,
+                gainPerMinute: 0, readyNotice: false
+            };
+            // Auto Build uses the Bonfire UI controls and only runs on that tab.
+            if (game.ui.activeTabId !== 'Bonfire') {
+                game.ui.activeTabId = 'Bonfire';
+                game.render();
+            }
+        }
+        const state = this.farmState;
+        if (maxKittens > state.lastCap) {
+            state.lastCap = maxKittens;
+            state.lastCapGrowthAt = now;
+        }
+        if (now - state.sampleAt >= 5 * 60 * 1000) {
+            state.gainPerMinute = (prestige - state.sampleParagon) / ((now - state.sampleAt) / 60000);
+            state.sampleParagon = prestige;
+            state.sampleAt = now;
+        }
+
+        this.model.auto.build = true;
+        this.model.auto.craft = true;
+        this.model.auto.hunt = true;
+        this.model.auto.party = true;
+        this.model.auto.explore = true;
+        this.model.auto.research = true;
+        this.model.auto.workshop = true;
+        this.model.auto.assign = true;
+        this.model.auto.embassy = false; // Legacy Auto Embassy assumes a valid EmbassyButton on every race.
+        this.model.minor.observe = true;
+        this.model.option.assign = 'smart';
+        this.model.option.book = 'default';
+        this.model.option.coreAlloy = 'default';
+
+        // No Time/Void/Cryptotheology investments in a Paragon farming run.
+        for (const name in this.model.timeBuildings) this.model.timeBuildings[name].enabled = false;
+        const allowedBonfire = {
+            field: 100, pasture: 70, aqueduct: 55, hut: 0, logHouse: 0,
+            mansion: 0, workshop: 55, library: 85, academy: 65,
+            observatory: 85, mine: 95, smelter: 85,
+            lumberMill: 85, quarry: 55, calciner: 40,
+            magneto: 45, steamworks: 35, factory: 35,
+            barn: 55, warehouse: 70, harbor: 65,
+            tradepost: 50, temple: 45, chapel: 50,
+            amphitheatre: 55, oilWell: 40, biolab: 20
+        };
+        for (const name in this.model.cathBuildings) {
+            const config = this.model.cathBuildings[name];
+            const allowed = Object.prototype.hasOwnProperty.call(allowedBonfire, name);
+            const building = allowed ? game.bld.get(name) : null;
+            const stage = building?.stages?.[building.stage || 0];
+            const prices = stage?.prices || building?.prices || [];
+            const safe = allowed && !prices.some((p) => protectedResources.includes(p.name));
+            config.enabled = safe;
+            if (safe) {
+                const limit = allowedBonfire[name];
+                if (limit > 0) config.limit = limit;
+                else delete config.limit;
+            }
+        }
+        // Space Stations are safe housing, but only while electricity has slack.
+        for (const name in this.model.spaceBuildings) {
+            this.model.spaceBuildings[name].enabled = name === 'spaceStation'
+                && (game.resPool.energyProd - game.resPool.energyCons) >= 20;
+            if (name === 'spaceStation') this.model.spaceBuildings[name].limit = 80;
+        }
+
+        // Only the first orbital program is useful for safe, non-exotic housing.
+        if (game.spaceTab?.visible && game.spaceTab?.GCPanel?.children) {
+            for (const program of game.spaceTab.GCPanel.children) {
+                const meta = program.model?.metadata;
+                if (meta?.name !== 'orbitalLaunch' || !meta.unlocked || meta.val > 0) continue;
+                const costs = program.model?.prices || meta.prices || [];
+                if (costs.some((p) => protectedResources.includes(p.name))) continue;
+                if (!program.model.enabled) program.controller.updateEnabled(program.model);
+                if (program.model.enabled) sk.tasks.buyItem(program);
+            }
+        }
+
+        // Ordinary trade only, never Leviathans or any race spending preserved resources.
+        const zebras = game.diplomacy?.get('zebras');
+        const titanium = game.resPool.get('titanium');
+        const manpower = game.resPool.get('manpower');
+        const gold = game.resPool.get('gold');
+        if (zebras?.unlocked && titanium?.maxValue > 0 && titanium.value < titanium.maxValue * 0.55
+            && manpower?.maxValue > 0 && gold?.maxValue > 0
+            && manpower.value > manpower.maxValue * 0.7 && gold.value > gold.maxValue * 0.7
+            && !zebras.buys.some((p) => protectedResources.includes(p.name))) {
+            const trades = Math.min(20, Math.floor(game.diplomacy.getMaxTradeAmt(zebras) * 0.2));
+            if (trades > 0) game.diplomacy.tradeMultiple(zebras, trades);
+        }
+
+        const elapsedMinutes = (now - state.startedAt) / 60000;
+        const maxStableMinutes = (now - state.lastCapGrowthAt) / 60000;
+        const atCapacity = maxKittens > 0 && kittens.value >= maxKittens - 2;
+        const gained = Math.max(0, prestige - state.startingParagon);
+        const average = gained / Math.max(elapsedMinutes, 1);
+        const capped = atCapacity && maxStableMinutes >= 7;
+        const diminishing = elapsedMinutes >= 25 && state.sampleAt > state.startedAt
+            && state.gainPerMinute < average * 0.5 && maxStableMinutes >= 5;
+        const timeout = elapsedMinutes >= 65;
+        const ready = elapsedMinutes >= 15 && prestige >= 200 && (capped || diminishing || timeout);
+        if (!ready) return false;
+
+        if (!this.model.minor.permitReset) {
+            if (!state.readyNotice) {
+                state.readyNotice = true;
+                game.msg(`Paragon Farm ready for reset: +${prestige} Paragon. Enable Permit Auto Play to Reset to proceed.`, 'important');
+                sk.saveOptions();
+            }
+            return false;
+        }
+
+        // Explicit opt-in only. Never call the legacy sellout() or reset(),
+        // which were designed for Chronosphere-heavy scripts.
+        const expected = game.getResetPrestige().paragonPoints;
+        if (expected < 200 || game.ironWill || game.challenges?.challenges?.some((c) => c.active || c.pending)) return false;
+        this.farmState = null; // Start a fresh efficiency window after the reload.
+        sk.saveOptions(); // Persist both independent opt-ins: auto.play and permitReset.
+        sk.tasks.halt();
+        const previousConfirm = game.ui.confirm;
+        try {
+            game.ui.confirm = (title, message, yes) => yes();
+            game.reset();
+        } finally {
+            game.ui.confirm = previousConfirm;
+        }
+        return false;
     }
 
     doReset(action) {
