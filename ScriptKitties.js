@@ -746,6 +746,95 @@ SK.Tasks = class {
         }
     }
 
+    // One minute of actual kitten consumption plus other catnip converters.
+    // Compare absolute quantities, not stock/demand, so zero demand is safe.
+    catnipDemandPerTick() {
+        const village = game.village;
+        const kittenCount = village.sim.kittens.length;
+        let consumption = (village.getResConsumption().catnip || 0)
+            * (1 + game.getEffect('catnipDemandRatio'));
+        if (kittenCount > 0 && village.happiness > 1) {
+            const happinessDemand = Math.max(
+                village.happiness * (1 + game.getEffect('hapinnessConsumptionRatio')) - 1, 0);
+            const workerFraction = game.challenges.isActive('anarchy')
+                ? 1 : 1 - village.getFreeKittens() / kittenCount;
+            consumption *= 1 + happinessDemand
+                * (1 + game.getEffect('catnipDemandWorkerRatioGlobal')) * workerFraction;
+        }
+        const converters = game.getResourcePerTickConvertion('catnip');
+        return Math.max(0, -consumption) + Math.max(0, -converters);
+    }
+
+    // Protect one minute of food even when the new building increases food output.
+    // Only Catnip Fields are guarded; Pastures reduce food demand and must stay available.
+    canSpendCatnipOnBuilding(button) {
+        if (button.model.metadata?.name !== 'field') return true;
+        const catnipCost = (button.model.prices || []).find((p) => p.name === 'catnip');
+        if (!catnipCost) return true;
+        const remaining = game.resPool.get('catnip').value - catnipCost.val;
+        const minute = 60 * game.ticksPerSecond;
+        return remaining >= minute * this.catnipDemandPerTick();
+    }
+
+    // Use the game's own catnip formula to estimate the effect of one more farmer.
+    // Temporarily change the cached job-production term only, never the actual jobs.
+    farmerMarginalCatnip() {
+        const village = game.village;
+        const farmer = village.getJob('farmer');
+        village.getResProduction(); // Materialize the lazy production cache.
+        const stored = village.resourceProduction.catnip || 0;
+        const rawPerFarmer = farmer.value > 0
+            ? stored / farmer.value
+            : (farmer.modifiers.catnip || 1) * Math.max(1, village.happiness);
+        if (!(rawPerFarmer > 0)) return 0;
+        const base = game.calcResourcePerTick('catnip');
+        try {
+            village.resourceProduction.catnip = stored + rawPerFarmer;
+            return Math.max(0, game.calcResourcePerTick('catnip') - base);
+        } finally {
+            village.resourceProduction.catnip = stored;
+        }
+    }
+
+    catnipNetPerTick() {
+        return game.calcResourcePerTick('catnip')
+            + game.getResourcePerTickConvertion('catnip');
+    }
+
+    // Last safety check after Smart Assign's balancing pass. If the estimated
+    // minimum was insufficient, transfer workers in batches until catnip is positive.
+    ensureCatnipSurplus() {
+        const village = game.village;
+        const farmer = village.getJob('farmer');
+        if (!farmer || !farmer.unlocked) return false;
+        const minimumNet = 0.01;
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const net = this.catnipNetPerTick();
+            if (net > minimumNet) return true;
+            const marginal = this.farmerMarginalCatnip();
+            if (!(marginal > 0)) return false;
+            const remainingWorkers = village.jobs.reduce((sum, job) =>
+                job.name === 'farmer' ? sum : sum + job.value, 0);
+            const wanted = Math.min(remainingWorkers + village.getFreeKittens(),
+                Math.max(1, Math.ceil((minimumNet - net) / marginal)));
+            if (!wanted) return false;
+            let toRelease = Math.max(0, wanted - village.getFreeKittens());
+            const donors = village.jobs.filter((job) =>
+                job.name !== 'farmer' && job.value > 0)
+                .sort((a, b) => b.value - a.value);
+            for (const donor of donors) {
+                if (!toRelease) break;
+                const count = Math.min(toRelease, donor.value);
+                village.sim.removeJob(donor.name, count);
+                toRelease -= count;
+            }
+            const available = Math.min(wanted, village.getFreeKittens());
+            if (!available) return false;
+            village.assignJob(farmer, available);
+        }
+        return this.catnipNetPerTick() > 0.01;
+    }
+
     // Build buildings automatically
     autoBuild(ticksPerCycle) {
         let built = false;
@@ -757,7 +846,8 @@ SK.Tasks = class {
                 const protectedCost = this.model.auto.play && this.model.option.script === 'paragonFarm'
                     && (button.model.prices || []).some((p) => this.model.exoticResources.includes(p.name));
                 if (button.model.enabled && !protectedCost && cb[name]?.enabled
-                        && (!cb[name].limit || button.model.metadata.val < cb[name].limit)) {
+                        && (!cb[name].limit || button.model.metadata.val < cb[name].limit)
+                        && this.canSpendCatnipOnBuilding(button)) {
                     if (this.buyItem(button)) built = true;
                 }
             }
@@ -1149,6 +1239,7 @@ SK.Tasks = class {
 
     smartAssign() {
         if (game.calendar.day < 0) return false; // temporal paradox messes up the cache
+        const winter = game.calendar.season === 3 || game.challenges.isActive('winterIsComing');
         const limits={};
         const fugit = game.time.isAccelerated ? 1.5 : 1;
 
@@ -1181,6 +1272,20 @@ SK.Tasks = class {
             }
         }
 
+        // Keep enough farmers to make current catnip production positive.
+        // In winter, never lower the existing farmer count.
+        const farmer = game.village.getJob('farmer');
+        let minimumFarmers = 0;
+        if (farmer?.unlocked) {
+            const perFarmer = this.farmerMarginalCatnip();
+            const catnipNet = this.catnipNetPerTick();
+            if (perFarmer > 0) {
+                minimumFarmers = Math.min(kittens, Math.max(0,
+                    Math.ceil(farmer.value + (0.01 - catnipNet) / perFarmer)));
+            }
+            if (winter) minimumFarmers = Math.max(minimumFarmers, farmer.value);
+        }
+
         // first calculate (and enforce) "hard" limits:
         for (const job of game.village.jobs) {
             // We need a better way of finding out what a kitten produces in each job
@@ -1188,7 +1293,7 @@ SK.Tasks = class {
             let ticksToFull = null;
             if (! job.unlocked) continue;
             if (job.value === 0) {
-                if (jobRatio[job.name]) limits[job.name] = 1; // can't calculate without at least one worker
+                if (job.name !== 'farmer' && jobRatio[job.name]) limits[job.name] = 1; // farmers need a dynamically calculated floor
                 continue;
             }
             switch (job.name) {
@@ -1257,10 +1362,8 @@ SK.Tasks = class {
             if (! job.unlocked || ! jobRatio[job.name]) continue;
             let minimum = Math.floor(jobRatio[job.name] * kittens / 2);
             if (limits[job.name]) minimum = Math.min(minimum, limits[job.name]);
+            if (job.name === 'farmer') minimum = Math.max(minimum, minimumFarmers);
             if (job.value < minimum) needs[job.name] = minimum - job.value;
-            if (job.name === 'farmer' && game.resPool.get('catnip').perTickCached < 0) {
-                needs[job.name] ||= 1; // if we're starving, add a farmer
-            }
         }
 
         // try to satisfy from free kittens
@@ -1280,27 +1383,29 @@ SK.Tasks = class {
             });
         }
 
-        // allocate necessary losses to the most over-allocated
-        distribution.sort((a, b) => b.cpe - a.cpe);
-        untilNeed: while (avails < totalNeed) {
-            for (let i=0; i<distribution.length; i+=1) {
-                if (i+1 >= distribution.length || distribution[i].cpe > distribution[i+1].cpe) {
-                    distribution[i].count -= 1;
-                    distribution[i].cpe = distribution[i].count / distribution[i].expected;
-                    totalNeed -= 1;
-                    continue untilNeed;
-                }
-            }
-            console.log('smartAssign: warning: could not satisfy needs');
-            break; // should very rarely happen, but infinite loops are really bad
+        // Free workers from overstaffed jobs, never sacrificing winter farmers.
+        // Refresh the free-worker count after unassigning, or their replacements
+        // will not actually be hired.
+        let toFree = Math.max(0, totalNeed - avails);
+        while (toFree > 0) {
+            const donors = distribution.filter((item) =>
+                item.count > (item.name === 'farmer' ? minimumFarmers : 0)
+                && !needs[item.name]
+                && !(winter && item.name === 'farmer'));
+            donors.sort((a, b) => b.cpe - a.cpe);
+            if (donors.length === 0) break;
+            const donor = donors[0];
+            donor.count--;
+            donor.cpe = donor.count / donor.expected;
+            toFree--;
         }
-        // lose them
         for (const job of game.village.jobs) {
             const dist = distribution.find((d) => job.name === d.name);
             if (dist && job.value > dist.count) {
                 game.village.sim.removeJob(job.name, job.value - dist.count);
             }
         }
+        avails = game.village.getFreeKittens();
 
         // do the needful
         for (const job of game.village.jobs) {
@@ -1319,7 +1424,6 @@ SK.Tasks = class {
         }
 
         // use up any remaining space
-        delete distribution.farmer;
         distribution.reverse();
         distribution = distribution.filter(function(x) {
             return x.name !== 'farmer' && (!limits[x.name] || x.count < limits[x.name]);
@@ -1344,6 +1448,7 @@ SK.Tasks = class {
                 if (hire) game.village.assignJob(job, hire);
             }
         }
+        this.ensureCatnipSurplus();
         return false;
     }
 
@@ -3190,8 +3295,8 @@ SK.Scripts = class {
         this.model.auto.embassy = false; // Legacy Auto Embassy assumes a valid EmbassyButton on every race.
         this.model.minor.observe = true;
         this.model.option.assign = 'smart';
-        this.model.option.book = 'default';
-        this.model.option.coreAlloy = 'default';
+        this.model.option.book = 'auto';
+        this.model.option.coreAlloy = 'auto';
 
         // No Time/Void/Cryptotheology investments in a Paragon farming run.
         for (const name in this.model.timeBuildings) this.model.timeBuildings[name].enabled = false;
