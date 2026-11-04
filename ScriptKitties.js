@@ -3312,11 +3312,14 @@ SK.Scripts = class {
                     || (stage === 'theology' && price.name === 'gold'));
         }
 
-        // Keep Space Station as the housing priority. Other space investments
-        // can be configured independently in a later iteration.
+        // Space progression stops at Cath and Redmoon. Do not enable Moon
+        // Base: its added storage would postpone the Space Station price cap.
+        const allowedSpaceBuildings = new Set([
+            'spaceElevator', 'sattelite', 'spaceStation', 'moonOutpost'
+        ]);
         for (const [name, config] of Object.entries(this.model.spaceBuildings)) {
             delete config.limit;
-            config.enabled = name === 'spaceStation';
+            config.enabled = allowedSpaceBuildings.has(name);
         }
         for (const config of Object.values(this.model.timeBuildings)) {
             config.enabled = false;
@@ -3382,8 +3385,10 @@ SK.Scripts = class {
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
         // Apply this updated profile once on existing saves, not every tick.
-        if (state.stage !== stage || state.farmProfileVersion !== 2) {
+        if (state.stage !== stage || state.farmProfileVersion !== 2
+                || state.spaceProfileVersion !== 1) {
             state.farmProfileVersion = 2;
+            state.spaceProfileVersion = 1;
             state.stage = stage;
             state.cappedSince = null;
             state.readyNotice = false;
@@ -3398,12 +3403,14 @@ SK.Scripts = class {
             this.singleTech(game.religionTab.rUpgradeButtons, ['solarRevolution']);
         }
 
-        // Launch the first orbital program through the existing UI task.
-        // Without it, Space Stations can remain locked forever after a reset.
-        if (game.spaceTab?.visible && game.spaceTab?.GCPanel?.children) {
-            for (const program of game.spaceTab.GCPanel.children) {
+        // Reach Cath, then Redmoon. Do not launch Dune, Piscine, or
+        // other space missions in a Paragon farming run.
+        if (game.spaceTab?.visible) {
+            sk.tasks.ensureContentExists('Space');
+            const allowedPrograms = new Set(['orbitalLaunch', 'moonMission']);
+            for (const program of game.spaceTab?.GCPanel?.children || []) {
                 const meta = program.model?.metadata;
-                if (meta?.name !== 'orbitalLaunch' || !meta.unlocked || meta.val > 0) continue;
+                if (!allowedPrograms.has(meta?.name) || !meta.unlocked || meta.val > 0) continue;
                 const costs = program.model?.prices || meta.prices || [];
                 if (costs.some((price) => this.model.exoticResources.includes(price.name))) continue;
                 if (!program.model.enabled) program.controller.updateEnabled(program.model);
