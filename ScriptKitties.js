@@ -124,6 +124,7 @@ SK.Model = class {
             elderTrade: 'Always Trade with the Elders',
             autoFixCC: 'Auto use Flux to fix Cryo Chambers',
             permitReset: 'Permit Auto Play to Reset',
+            ecoBuildings: 'Keep Bio Labs Off and Disable Pumpjacks',
         };
 
         // These will allow quick selection of the buildings which consume energy
@@ -143,7 +144,7 @@ SK.Model = class {
             'void',
             // Resources that survive ordinary resets or are used to develop
             // preserved progression must also be protected by Conserve Exotic.
-            'timeCrystal', 'unobtainium', 'eludium', 'necrocorn',
+            'timeCrystal', 'necrocorn',
             'sorrow', 'paragon', 'burnedParagon', 'karma',
         ];
 
@@ -165,6 +166,7 @@ SK.Model = class {
             // everything not specified defaults to false
             observe: true,
             conserveExotic: true,
+            ecoBuildings: true,
             partyLimit: 10,
             lowCatnipTrade: true,
             elderTrade: true,
@@ -519,6 +521,7 @@ SK.Tasks = class {
             {fn:'autoSpace',    interval:10, offset:2,   override:false},
             {fn:'autoTime',     interval:10, offset:4,   override:false},
             {fn:'autoParty',    interval:10, offset:6,   override:false},
+            {fn:'autoEcoBuildings',interval:10, offset:5, override:false},
             {fn:'energyControl',interval:10, offset:8,   override:false},
 
             // every 4 seconds; schedule on odd numbers to avoid the interval:10
@@ -845,6 +848,7 @@ SK.Tasks = class {
         let built = false;
         if (this.model.auto.build && game.ui.activeTabId === 'Bonfire') {
             const cb = this.model.cathBuildings;
+            let availableEnergy = game.resPool.energyProd - game.resPool.energyCons;
             for (var button of sk.bldTabChildren()) {
                 if (! button.model.metadata) continue;
                 const name = button.model.metadata.name;
@@ -852,8 +856,13 @@ SK.Tasks = class {
                     && (button.model.prices || []).some((p) => this.model.exoticResources.includes(p.name));
                 if (button.model.enabled && !protectedCost && cb[name]?.enabled
                         && (!cb[name].limit || button.model.metadata.val < cb[name].limit)
-                        && this.canSpendCatnipOnBuilding(button)) {
-                    if (this.buyItem(button)) built = true;
+                        && this.canSpendCatnipOnBuilding(button)
+                        && this.canBuildWithEnergy(button.model.metadata, availableEnergy)) {
+                    const neededEnergy = this.buildingEnergyCost(button.model.metadata, true);
+                    if (this.buyItem(button)) {
+                        built = true;
+                        availableEnergy -= neededEnergy;
+                    }
                 }
             }
         }
@@ -1073,6 +1082,7 @@ SK.Tasks = class {
         let built = false;
         if (this.model.auto.build && game.spaceTab.visible) {
             this.ensureContentExists('Space');
+            let availableEnergy = game.resPool.energyProd - game.resPool.energyCons;
 
             // Build space buildings
             const sb = this.model.spaceBuildings;
@@ -1081,11 +1091,16 @@ SK.Tasks = class {
                     const protectedCost = this.model.auto.play && this.model.option.script === 'paragonFarm'
                         && (spBuild.model.prices || []).some((p) => this.model.exoticResources.includes(p.name));
                     if (!protectedCost && sb[spBuild.id]?.enabled && game.space.getBuilding(spBuild.id).unlocked
-                            && (!sb[spBuild.id].limit || spBuild.model.metadata.val < sb[spBuild.id].limit)) {
+                            && (!sb[spBuild.id].limit || spBuild.model.metadata.val < sb[spBuild.id].limit)
+                            && this.canBuildWithEnergy(spBuild.model.metadata, availableEnergy)) {
                         // .enabled doesn't update automatically unless the tab is active, force it
                         if (! spBuild.model.enabled) spBuild.controller.updateEnabled(spBuild.model);
                         if (spBuild.model.enabled) {
-                            if (this.buyItem(spBuild)) built = true;
+                            const neededEnergy = this.buildingEnergyCost(spBuild.model.metadata, true);
+                            if (this.buyItem(spBuild)) {
+                                built = true;
+                                availableEnergy -= neededEnergy;
+                            }
                         }
                     }
                 }
@@ -1118,6 +1133,7 @@ SK.Tasks = class {
     autoTime(ticksPerCycle) {
         let built = false;
         if (this.model.auto.build) {
+            let availableEnergy = game.resPool.energyProd - game.resPool.energyCons;
             const buttonGroups = [
                 game.religionTab?.zgUpgradeButtons,
                 game.religionTab?.ctPanel?.children[0]?.children,
@@ -1135,10 +1151,15 @@ SK.Tasks = class {
                         const protectedCost = this.model.auto.play && this.model.option.script === 'paragonFarm'
                             && (button.model?.prices || []).some((p) => this.model.exoticResources.includes(p.name));
                         if (!protectedCost && tb[button.id]?.enabled && button.model?.metadata?.unlocked
-                                && (!tb[button.id].limit || button.model.metadata.val < tb[button.id].limit)) {
+                                && (!tb[button.id].limit || button.model.metadata.val < tb[button.id].limit)
+                                && this.canBuildWithEnergy(button.model.metadata, availableEnergy)) {
                             if (! button.model.enabled) button.controller.updateEnabled(button.model);
                             if (button.model.enabled) {
-                                if (this.buyItem(button)) built = true;
+                                const neededEnergy = this.buildingEnergyCost(button.model.metadata, true);
+                                if (this.buyItem(button)) {
+                                    built = true;
+                                    availableEnergy -= neededEnergy;
+                                }
                             }
                         }
                     }
@@ -1167,79 +1188,87 @@ SK.Tasks = class {
         return false; // there is never a need to re-run
     }
 
-    // Control Energy Consumption
+    // Use current per-building effects and the same global multiplier as the
+    // game's energy accounting. Do not rely on hard-coded consumption values.
+    buildingEnergyCost(building, assumeEcoPolicy = false) {
+        if (!building) return 0;
+        if (assumeEcoPolicy && this.model.minor.ecoBuildings
+                && (building.name === 'biolab' || building.name === 'oilWell')) {
+            // These buildings are switched off / have Pumpjack disabled after
+            // purchase. They need no additional running power in this mode.
+            return 0;
+        }
+        const stage = building.stages?.[building.stage || 0];
+        const base = Number(building.effects?.energyConsumption ?? stage?.effects?.energyConsumption ?? 0);
+        if (!(base > 0)) return 0;
+        const ratio = 1 + game.getLimitedDR(game.getEffect('energyConsumptionRatio'), 1)
+            + game.getEffect('energyConsumptionIncrease');
+        return base * Math.max(0, ratio);
+    }
+
+    // Used by the ordinary Bonfire, Space and Time auto-builders.
+    // Purchase only when the new building can run without an energy deficit.
+    canBuildWithEnergy(building, available = game.resPool.energyProd - game.resPool.energyCons) {
+        const required = this.buildingEnergyCost(building, true);
+        if (!required) return true;
+        return available + 1e-8 >= required;
+    }
+
+    // Independently of Energy Control, keep Bio Labs inactive and disable
+    // Pumpjack automation after its upgrade becomes available. The Oil Wells
+    // themselves remain on and continue producing oil without Pumpjack.
+    autoEcoBuildings() {
+        if (!this.model.auto.build || !this.model.minor.ecoBuildings) return false;
+        let changed = false;
+        const biolab = game.bld.get('biolab');
+        if (biolab?.on > 0) {
+            biolab.on = 0;
+            changed = true;
+        }
+        const oilWell = game.bld.get('oilWell');
+        if (oilWell?.isAutomationEnabled === true) {
+            oilWell.isAutomationEnabled = false;
+            // The game uses this same upgrade call when the player toggles
+            // building automation; it recalculates energy and pollution effects.
+            game.upgrade({buildings: ['oilWell']});
+            changed = true;
+        }
+        return changed;
+    }
+
+    // Manage ONLY production buildings on Bonfire. Cycle through one unit of
+    // each type in order, skipping Oil Wells unless Pumpjack is active.
+    // Science buildings and all space buildings are deliberately excluded.
     energyControl(ticksPerCycle) {
-        if (this.model.auto.energy) {
-            const proVar = game.resPool.energyProd;
-            let conVar = game.resPool.energyCons;
+        if (!this.model.auto.energy) return false;
 
-            // TODO:
-            // generally when I have to turn things off:
-            // 1. off go the biolabs
-            // 2. off go the pumpjack
-            // 3. off goes the accelerators
-            // ---
-            // now we turn something on...
-            // T. enable thorium reactors
-            // ---
-            // now things I care about start going off:
-            // 4. factory
-            // 5. calciner
-            // 6. orbital array
-            // 7. lunar outposts
-            // 8. moon bases
-            // ---
-            // finals:
-            // X. Entanglement Station
-            // X. Chronocontrol
-            // X. Containment chambers
-            // Y. Space Stations -- note, never auto enable space stations
-            // ---
+        const surplus = game.resPool.energyProd - game.resPool.energyCons;
+        const isDeficit = surplus < -1e-8;
+        const reserve = 2; // Keep a small buffer to prevent rapid on/off flicker.
+        if (!isDeficit && surplus <= reserve) return false;
 
-            // Xenosage's recommendations
-            // 1. Trim Energy Containment to either zero, or what's necessary to allow AM growth
-            // 2. make sure biolabs only turn off if they're consuming power
-            // 3. turn off many buildings per tick
-            if (this.model.power.accelerator.val > this.model.power.accelerator.on && proVar > (conVar + 3)) {
-                this.model.power.accelerator.on++;
-                conVar++;
-            } else if (this.model.power.calciner.val > this.model.power.calciner.on && proVar > (conVar + 3)) {
-                this.model.power.calciner.on++;
-                conVar++;
-            } else if (this.model.power.factory.val > this.model.power.factory.on && proVar > (conVar + 3)) {
-                this.model.power.factory.on++;
-                conVar++;
-            } else if (this.model.power.oilWell.val > this.model.power.oilWell.on && proVar > (conVar + 3)) {
-                // pumpjack is optional, we should reduce wells.on until we'd get more production
-                // from all on and pumpjack off
-                this.model.power.oilWell.on++;
-                conVar++;
-            } else if (this.model.power.biolab.val > this.model.power.biolab.on && proVar > (conVar + 3)) {
-                // only if we have the tech that makes them cost power
-                this.model.power.biolab.on++;
-                conVar++;
-            } else if (this.model.power.biolab.on > 0 && proVar < conVar) {
-                this.model.power.biolab.on--;
-                conVar--;
-            } else if (this.model.power.oilWell.on > 0 && proVar < conVar) {
-                this.model.power.oilWell.on--;
-                conVar--;
-            } else if (this.model.power.factory.on > 0 && proVar < conVar) {
-                this.model.power.factory.on--;
-                conVar--;
-            } else if (this.model.power.calciner.on > 0 && proVar < conVar) {
-                this.model.power.calciner.on--;
-                conVar--;
-            } else if (this.model.power.accelerator.on > 0 && proVar < conVar) {
-                this.model.power.accelerator.on--;
-                conVar--;
+        const order = ['calciner', 'accelerator', 'factory', 'oilWell'];
+        const cursorField = isDeficit ? 'energyOffCursor' : 'energyOnCursor';
+        const start = this[cursorField] || 0;
+        for (let shift = 0; shift < order.length; ++shift) {
+            const index = (start + shift) % order.length;
+            const name = order[index];
+            const building = game.bld.get(name);
+            if (!building || (name === 'oilWell' && !building.isAutomationEnabled)) continue;
+            const cost = this.buildingEnergyCost(building);
+            if (!(cost > 0)) continue;
+            if (isDeficit) {
+                if (building.on <= 0) continue;
+                building.on -= 1;
+            } else {
+                if (building.on >= building.val || surplus < cost + reserve) continue;
+                building.on += 1;
             }
-            // other things that cost energy: orbital arrays, moon bases, lunar outposts
-            // also spacestations, but I don't think we should auto turn them off
+            this[cursorField] = (index + 1) % order.length;
+            return true;
         }
         return false;
     }
-
     /*** These scripts run every 4 seconds ***/
 
     smartAssign() {
@@ -3226,8 +3255,8 @@ SK.Scripts = class {
     // Manual changes remain effective until the next stage transition or reset.
     paragonFarmConfigure(stage) {
         const protectedResources = [
-            'timeCrystal', 'relic', 'void', 'antimatter', 'unobtainium',
-            'eludium', 'blackcoin', 'bloodstone', 'necrocorn', 'sorrow',
+            'timeCrystal', 'relic', 'void', 'antimatter',
+            'blackcoin', 'bloodstone', 'necrocorn', 'sorrow',
             'temporalFlux', 'paragon', 'burnedParagon', 'karma'
         ];
         for (const resource of protectedResources) {
@@ -3242,7 +3271,7 @@ SK.Scripts = class {
             // The only scripted religion purchase before Solar Revolution is
             // Solar Revolution itself, so Faith and Gold can accumulate.
             religion: stage === 'solar', praise: stage === 'solar',
-            trade: false, embassy: false, unicorn: false, energy: false,
+            trade: false, embassy: false, unicorn: false, energy: true,
             cycle: false, shatter: false, bcoin: false, flux: false
         });
         Object.assign(this.model.minor, {
@@ -3336,7 +3365,8 @@ SK.Scripts = class {
         const theology = Boolean(game.science.get('theology')?.researched);
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
-        if (state.stage !== stage) {
+        if (state.stage !== stage || state.energyProfileVersion !== 1) {
+            state.energyProfileVersion = 1;
             state.stage = stage;
             state.cappedSince = null;
             state.readyNotice = false;
