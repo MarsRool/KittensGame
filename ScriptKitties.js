@@ -1554,6 +1554,10 @@ SK.Tasks = class {
     autoReligion(ticksPerCycle) {
         let built = false;
         let futureBuy = false;
+        // Before Solar Revolution, Paragon Farm buys only that milestone
+        // through paragonFarm(). Keep normal Religion enabled for later.
+        if (this.model.auto.play && this.model.option.script === 'paragonFarm'
+                && !game.religion.getRU('solarRevolution')?.on) return false;
         if (this.model.auto.religion && game.religionTab.visible) {
             this.ensureContentExists('Religion');
 
@@ -1610,8 +1614,11 @@ SK.Tasks = class {
     // Trade automatically
     autoTrade(ticksPerCycle, consecutive) {
         let traded = false;
-        if (this.model.auto.trade && game.diplomacyTab.visible
-                && !(this.model.auto.play && this.model.option.script === 'paragonFarm')) {
+        if (this.model.auto.trade && game.diplomacyTab.visible) {
+            const farming = this.model.auto.play && this.model.option.script === 'paragonFarm';
+            // Save Gold for Solar Revolution while Theology is being completed.
+            if (farming && game.science.get('theology')?.researched
+                    && !game.religion.getRU('solarRevolution')?.on) return false;
             const goldResource = game.resPool.get('gold');
             const goldPerCycle = game.getResourcePerTick('gold') * ticksPerCycle;
             const goldCost = game.diplomacy.getGoldCost();
@@ -1650,7 +1657,7 @@ SK.Tasks = class {
             }
 
             // Always Trade with the Elders enabled, trade max with them if possible
-            if (tradeLimit > 0 && this.model.minor.elderTrade) {
+            if (tradeLimit > 0 && this.model.minor.elderTrade && !farming) {
                 const leviathans = game.diplomacy.get('leviathans');
                 if (leviathans.unlocked) {
                     const unoRes = game.resPool.get('unobtainium');
@@ -1672,6 +1679,8 @@ SK.Tasks = class {
                 let best = {race:null, ratio:gains};
                 for (const race of game.diplomacy.races) {
                     if (! race.unlocked) continue;
+                    if (farming && (race.name === 'leviathans' || race.buys?.some((price) =>
+                            this.model.exoticResources.includes(price.name)))) continue;
                     if (this.model.minor.elderTrade && race.name === 'leviathans') continue; // already done
                     // TODO: trade limit could distort the calculation below,
                     // we should calculate the best trade on a strict 20% for
@@ -1694,6 +1703,7 @@ SK.Tasks = class {
                 if (best.race) {
                     // console.log(`We should trade ${best.trades} times with ${best.race.name} for ratio: ${best.ratio} on ${best.res}`);
                     for (const resName in best.res) {
+                        if (farming && this.model.exoticResources.includes(resName)) continue;
                         const res = game.resPool.get(resName);
                         const excess = res.value + best.res[resName] - res.maxValue;
                         if (res.maxValue && excess > 0) this.makeSpace(res, excess);
@@ -1785,6 +1795,8 @@ SK.Tasks = class {
                     best = {button:button, price:price};
                 }
             }
+            // No available embassy may exist in early runs.
+            if (!best.button) return false;
             // max culture will often be slightly less than max due to manuscript fluctuations
             if (culture.value >= culture.maxValue * 0.99 || best.price < culturePerCycle) {
                 // This hack HURTS... For some godforsaken reason, EmbassyButtonController.buyItem invokes
@@ -1869,6 +1881,10 @@ SK.Tasks = class {
             let bestTears = {button:null, value:0};
             let bestIvory = {button:null, value:0};
             for (const button of game.religionTab.zgUpgradeButtons) {
+                // Preserve Gold for the Solar Revolution milestone.
+                if (this.model.auto.play && this.model.option.script === 'paragonFarm'
+                        && !game.religion.getRU('solarRevolution')?.on
+                        && button.model.prices.some((price) => price.name === 'gold')) continue;
                 if (button.model.metadata.unlocked) {
                     const tearCost = button.model.prices.find((element) => element.name === 'tears');
                     if (tearCost) {
@@ -3270,8 +3286,8 @@ SK.Scripts = class {
             explore: true, research: true, workshop: true, assign: true,
             // The only scripted religion purchase before Solar Revolution is
             // Solar Revolution itself, so Faith and Gold can accumulate.
-            religion: stage === 'solar', praise: stage === 'solar',
-            trade: false, embassy: false, unicorn: false, energy: true,
+            religion: true, praise: stage === 'solar',
+            trade: true, embassy: true, unicorn: true, energy: true,
             cycle: false, shatter: false, bcoin: false, flux: false
         });
         Object.assign(this.model.minor, {
@@ -3365,8 +3381,9 @@ SK.Scripts = class {
         const theology = Boolean(game.science.get('theology')?.researched);
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
-        if (state.stage !== stage || state.energyProfileVersion !== 1) {
-            state.energyProfileVersion = 1;
+        // Apply this updated profile once on existing saves, not every tick.
+        if (state.stage !== stage || state.farmProfileVersion !== 2) {
+            state.farmProfileVersion = 2;
             state.stage = stage;
             state.cappedSince = null;
             state.readyNotice = false;
