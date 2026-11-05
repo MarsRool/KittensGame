@@ -843,25 +843,95 @@ SK.Tasks = class {
         return this.catnipNetPerTick() > 0.01;
     }
 
+    // Nominal per-tick inputs for Bonfire converters. Some live effects are
+    // scaled down when stock is empty; never mistake starvation for free capacity.
+    converterInputs(building) {
+        if (!building) return null;
+        const base = {
+            smelter: {wood: 0.05, minerals: 0.1},
+            calciner: {minerals: 1.5, oil: 0.024},
+            accelerator: {titanium: 0.015}
+        }[building.name];
+        if (!base) return null;
+        const inputs = {...base};
+        for (const effects of [building.effectsCalculated, building.effects]) {
+            if (!effects) continue;
+            for (const [key, value] of Object.entries(effects)) {
+                if (!key.endsWith('PerTickCon') || !Number.isFinite(value) || value >= 0) continue;
+                const resource = key.slice(0, -'PerTickCon'.length);
+                inputs[resource] = Math.max(inputs[resource] || 0, -value);
+            }
+        }
+        return inputs;
+    }
+
+    // A snapshot makes sequential purchases safe, even when the game updates
+    // resource-per-tick caches only after the whole Auto Build pass finishes.
+    converterBudget() {
+        const nominalConsumption = Object.create(null);
+        for (const name of ['smelter', 'calciner', 'accelerator']) {
+            const building = game.bld.get(name);
+            if (!building || !(building.on > 0)) continue;
+            for (const [resource, amount] of Object.entries(this.converterInputs(building) || {})) {
+                nominalConsumption[resource] = (nominalConsumption[resource] || 0)
+                    + amount * building.on;
+            }
+        }
+        return {nominalConsumption, resources: Object.create(null)};
+    }
+
+    canBuildConverter(inputs, budget) {
+        if (!inputs) return true;
+        const reserveFactor = 5;
+        for (const [resource, newConsumption] of Object.entries(inputs)) {
+            if (!(newConsumption > 0)) continue;
+            let state = budget.resources[resource];
+            if (!state) {
+                const production = game.getResourcePerTick(resource);
+                const liveConsumption = Math.max(0, -game.getResourcePerTickConvertion(resource));
+                state = budget.resources[resource] = {
+                    production,
+                    consumption: Math.max(liveConsumption, budget.nominalConsumption[resource] || 0)
+                };
+            }
+            if (!Number.isFinite(state.production) ||
+                    !(state.production > reserveFactor * (state.consumption + newConsumption))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    reserveConverterInputs(inputs, budget) {
+        if (!inputs) return;
+        for (const [resource, amount] of Object.entries(inputs)) {
+            if (amount > 0) budget.resources[resource].consumption += amount;
+        }
+    }
+
     // Build buildings automatically
     autoBuild(ticksPerCycle) {
         let built = false;
         if (this.model.auto.build && game.ui.activeTabId === 'Bonfire') {
             const cb = this.model.cathBuildings;
             let availableEnergy = game.resPool.energyProd - game.resPool.energyCons;
+            const converterBudget = this.converterBudget();
             for (var button of sk.bldTabChildren()) {
                 if (! button.model.metadata) continue;
                 const name = button.model.metadata.name;
+                const converterInputs = this.converterInputs(button.model.metadata);
                 const protectedCost = this.model.auto.play && this.model.option.script === 'paragonFarm'
                     && (button.model.prices || []).some((p) => this.model.exoticResources.includes(p.name));
                 if (button.model.enabled && !protectedCost && cb[name]?.enabled
                         && (!cb[name].limit || button.model.metadata.val < cb[name].limit)
                         && this.canSpendCatnipOnBuilding(button)
-                        && this.canBuildWithEnergy(button.model.metadata, availableEnergy)) {
+                        && this.canBuildWithEnergy(button.model.metadata, availableEnergy)
+                        && this.canBuildConverter(converterInputs, converterBudget)) {
                     const neededEnergy = this.buildingEnergyCost(button.model.metadata, true);
                     if (this.buyItem(button)) {
                         built = true;
                         availableEnergy -= neededEnergy;
+                        this.reserveConverterInputs(converterInputs, converterBudget);
                     }
                 }
             }
@@ -3309,7 +3379,7 @@ SK.Scripts = class {
             const prices = game.bld.getPrices(name) || building?.prices || [];
             config.enabled = Boolean(building)
                 && !prices.some((price) => this.model.exoticResources.includes(price.name)
-                    || (stage === 'theology' && price.name === 'gold'));
+                    || (stage === 'theology' && name !== 'temple' && price.name === 'gold'));
         }
 
         // Space progression stops at Cath and Redmoon. Do not enable Moon
@@ -3385,9 +3455,9 @@ SK.Scripts = class {
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
         // Apply this updated profile once on existing saves, not every tick.
-        if (state.stage !== stage || state.farmProfileVersion !== 2
+        if (state.stage !== stage || state.farmProfileVersion !== 3
                 || state.spaceProfileVersion !== 1) {
-            state.farmProfileVersion = 2;
+            state.farmProfileVersion = 3;
             state.spaceProfileVersion = 1;
             state.stage = stage;
             state.cappedSince = null;
