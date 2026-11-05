@@ -3555,10 +3555,11 @@ SK.Scripts = class {
                     || (stage === 'theology' && name !== 'temple' && price.name === 'gold'));
         }
 
-        // Space progression stops at Cath and Redmoon. Do not enable Moon
-        // Base: its added storage would postpone the Space Station price cap.
+        // Farm Starcharts using Research Vessels on Piscine.
+        // Keep Moon Base, Orbital Array and all other space buildings disabled.
         const allowedSpaceBuildings = new Set([
-            'spaceElevator', 'sattelite', 'spaceStation', 'moonOutpost'
+            'spaceElevator', 'sattelite', 'spaceStation', 'moonOutpost',
+            'researchVessel'
         ]);
         for (const [name, config] of Object.entries(this.model.spaceBuildings)) {
             delete config.limit;
@@ -3629,9 +3630,9 @@ SK.Scripts = class {
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
         // Apply this updated profile once on existing saves, not every tick.
         if (state.stage !== stage || state.farmProfileVersion !== 5
-                || state.spaceProfileVersion !== 1) {
+                || state.spaceProfileVersion !== 2) {
             state.farmProfileVersion = 5;
-            state.spaceProfileVersion = 1;
+            state.spaceProfileVersion = 2;
             state.stage = stage;
             state.cappedSince = null;
             state.readyNotice = false;
@@ -3650,11 +3651,11 @@ SK.Scripts = class {
             this.singleTech(game.religionTab.rUpgradeButtons, ['solarRevolution']);
         }
 
-        // Reach Cath, then Redmoon. Do not launch Dune, Piscine, or
-        // other space missions in a Paragon farming run.
+        // Reach Cath, Redmoon and Piscine for Research Vessels.
+        // Do not launch Dune or any other space missions.
         if (game.spaceTab?.visible) {
             sk.tasks.ensureContentExists('Space');
-            const allowedPrograms = new Set(['orbitalLaunch', 'moonMission']);
+            const allowedPrograms = new Set(['orbitalLaunch', 'moonMission', 'piscineMission']);
             for (const program of game.spaceTab?.GCPanel?.children || []) {
                 const meta = program.model?.metadata;
                 if (!allowedPrograms.has(meta?.name) || !meta.unlocked || meta.val > 0) continue;
