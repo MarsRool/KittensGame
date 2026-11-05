@@ -125,6 +125,7 @@ SK.Model = class {
             autoFixCC: 'Auto use Flux to fix Cryo Chambers',
             permitReset: 'Permit Auto Play to Reset',
             ecoBuildings: 'Keep Bio Labs Off and Disable Pumpjacks',
+            autoStageUpgrades: 'Auto Upgrade Bonfire Building Stages',
         };
 
         // These will allow quick selection of the buildings which consume energy
@@ -167,6 +168,7 @@ SK.Model = class {
             observe: true,
             conserveExotic: true,
             ecoBuildings: true,
+            autoStageUpgrades: true,
             partyLimit: 10,
             lowCatnipTrade: true,
             elderTrade: true,
@@ -909,6 +911,72 @@ SK.Tasks = class {
         }
     }
 
+    // Switch Bonfire stages only after the calciner's titanium-production
+    // improvements are researched. Stage conversion sells every old building.
+    autoUpgradeBonfireStages() {
+        if (!game.workshop.get('oxidation')?.researched
+                || !game.workshop.get('rotaryKiln')?.researched) return false;
+
+        // Only ordinary stage conversions. Never convert Warehouse to Spaceport:
+        // its loss of storage would significantly delay a Paragon farming reset.
+        // Energy-producing stages go first, followed by ordinary buildings and
+        // finally Data Centers, which consume electricity.
+        const candidates = ['pasture', 'aqueduct', 'amphitheatre', 'library'];
+        for (const name of candidates) {
+            if (!this.model.cathBuildings[name]?.enabled) continue;
+            const building = game.bld.get(name);
+            if (!building?.stages) continue;
+            const next = building.stages[building.stage + 1];
+            if (!next?.stageUnlocked) continue;
+
+            // The old stage is completely sold, so do not convert until at
+            // least one unit of the new stage is affordable WITHOUT its refund.
+            if (!next.prices?.every((price) => {
+                const resource = game.resPool.get(price.name);
+                return resource && resource.value + 1e-8 >= price.val;
+            })) continue;
+
+            // The first Data Center must fit available energy. Each later one
+            // is handled separately by canBuildWithEnergy() in Auto Build.
+            let energyPerUnit = Number(next.effects?.energyConsumption || 0);
+            if (name === 'library' && game.workshop.get('cryocomputing')?.researched) {
+                energyPerUnit = 1;
+            }
+            const requiredEnergy = this.buildingEnergyCost({name, effects: {
+                energyConsumption: energyPerUnit
+            }});
+            const surplus = game.resPool.energyProd - game.resPool.energyCons;
+            if (requiredEnergy > surplus + 1e-8) continue;
+
+            // Pastures and Aqueducts can be essential to food production.
+            // Simulate their removal, also covering happiness changes from
+            // Amphitheatres. Restore the live count even if the check fails.
+            const previousOn = building.on;
+            if (previousOn > 0) {
+                let afterNet, afterDemand;
+                try {
+                    building.on = 0;
+                    afterNet = this.catnipNetPerTick();
+                    afterDemand = this.catnipDemandPerTick();
+                } finally {
+                    building.on = previousOn;
+                }
+                if (!(afterNet > 0) || !Number.isFinite(afterDemand)
+                        || game.resPool.get('catnip').value
+                            < 60 * game.ticksPerSecond * afterDemand) continue;
+            }
+
+            const button = sk.bldTabChildren().find((child) =>
+                child.model?.metadata?.name === name && child.controller?.deltagrade);
+            if (!button) continue;
+            // Use the game's regular conversion method. The user explicitly
+            // enabled automatic stage changes, so do not open a confirmation.
+            button.controller.deltagrade(button.model, 1);
+            return true; // Game renders during deltagrade; never use stale buttons.
+        }
+        return false;
+    }
+
     // Build buildings automatically
     autoBuild(ticksPerCycle) {
         let built = false;
@@ -934,6 +1002,11 @@ SK.Tasks = class {
                         this.reserveConverterInputs(converterInputs, converterBudget);
                     }
                 }
+            }
+            // Switch at most one stage per pass: it sells all old-stage units
+            // and rerenders the Bonfire tab, invalidating existing buttons.
+            if (this.model.minor.autoStageUpgrades && this.autoUpgradeBonfireStages()) {
+                return true;
             }
         }
         // if (built) game.render(); // update tooltip, is kinda slow
@@ -3363,7 +3436,8 @@ SK.Scripts = class {
         Object.assign(this.model.minor, {
             conserveExotic: true, elderTrade: false, feed: false,
             program: false, autoFixCC: false, praiseAfter: false,
-            observe: true, promote: stage === 'solar'
+            observe: true, promote: stage === 'solar',
+            autoStageUpgrades: true
         });
         Object.assign(this.model.option, {
             assign: 'smart', book: 'auto', coreAlloy: 'auto'
@@ -3455,9 +3529,9 @@ SK.Scripts = class {
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
         // Apply this updated profile once on existing saves, not every tick.
-        if (state.stage !== stage || state.farmProfileVersion !== 3
+        if (state.stage !== stage || state.farmProfileVersion !== 4
                 || state.spaceProfileVersion !== 1) {
-            state.farmProfileVersion = 3;
+            state.farmProfileVersion = 4;
             state.spaceProfileVersion = 1;
             state.stage = stage;
             state.cappedSince = null;
