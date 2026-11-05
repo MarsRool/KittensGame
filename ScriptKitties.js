@@ -116,6 +116,8 @@ SK.Model = class {
             observe: 'Auto Observe',
             feed: 'Auto Feed Elders',
             promote: 'Auto Promote Leader',
+            promoteKittens: 'Auto Promote Kittens (Gold Surplus)',
+            autoFarmPolicies: 'Auto Paragon Farm Policies',
             wait4void: 'Only Shatter at Season Start',
             praiseAfter: 'Praise After Religion',
             unicornIvory: 'Unicorn Ivory Optimization',
@@ -169,6 +171,8 @@ SK.Model = class {
             conserveExotic: true,
             ecoBuildings: true,
             autoStageUpgrades: true,
+            promoteKittens: false,
+            autoFarmPolicies: false,
             partyLimit: 10,
             lowCatnipTrade: true,
             elderTrade: true,
@@ -1167,9 +1171,71 @@ SK.Tasks = class {
         }
         return false;
     }
+    // Appoint an employed kitten as leader as soon as Register allows it.
+    // Never replace a leader manually selected by the player.
+    ensureParagonFarmLeader() {
+        const village = game.village;
+        if (village.leader || !village.canHaveLeaderOrPromote()) return false;
+        const kittens = village.sim?.kittens || [];
+        if (!kittens.length) return false;
+
+        const score = (kitten) => {
+            const priority = {scholar: 1000, farmer: 600, priest: 400};
+            const trait = typeof kitten.trait === 'string' ? kitten.trait : kitten.trait?.name;
+            return (priority[kitten.job] || (kitten.job ? 100 : 0))
+                + (kitten.job === 'scholar' && trait === 'scientist' ? 200 : 0)
+                + (kitten.rank || 0) * 10
+                + (kitten.skills?.[kitten.job] || 0) / 10000;
+        };
+        const employed = kittens.filter((kitten) => kitten.job);
+        const candidates = employed.length ? employed : kittens;
+        const best = candidates.reduce((a, b) => score(b) > score(a) ? b : a);
+        village.makeLeader(best);
+        return village.leader === best;
+    }
+
+    // Gold is more valuable for development than mass promotion. Use only a
+    // small portion of a nearly-full Gold stockpile once per minute.
+    promoteParagonFarmKittens() {
+        const now = Date.now();
+        if (this.lastParagonFarmPromotionAt && now - this.lastParagonFarmPromotionAt < 60000) {
+            return false;
+        }
+        this.lastParagonFarmPromotionAt = now;
+        const village = game.village;
+        if (!village.canHaveLeaderOrPromote()) return false;
+        const gold = game.resPool.get('gold');
+        if (!(gold.maxValue > 0) || gold.value < gold.maxValue * 0.90) return false;
+        const reserve = Math.max(500, gold.maxValue * 0.60);
+        if (gold.value <= reserve) return false;
+
+        const candidates = village.sim.kittens.filter((kitten) =>
+            kitten.job && kitten !== village.leader &&
+            kitten.exp >= village.getRankExp(kitten.rank));
+        // Engineer rank gates are useful for higher-tier crafts.
+        candidates.sort((a, b) =>
+            Number(b.job === 'engineer') - Number(a.job === 'engineer') ||
+            a.rank - b.rank);
+        let promoted = 0;
+        for (const kitten of candidates) {
+            if (promoted >= 20) break;
+            const cost = 25 * (kitten.rank + 1);
+            if (gold.value - cost < reserve) continue;
+            if (village.sim.promote(kitten) > 0) promoted++;
+        }
+        return promoted > 0;
+    }
+
     // Collection of Minor Auto Tasks
     autoMinor(ticksPerCycle) {
         let override = false;
+        if (this.model.auto.play && this.model.option.script === 'paragonFarm') {
+            this.ensureParagonFarmLeader();
+            if (this.model.minor.promoteKittens &&
+                    game.religion.getRU('solarRevolution').on) {
+                this.promoteParagonFarmKittens();
+            }
+        }
         if (this.model.minor.feed) {
             const ncorns = game.resPool.get('necrocorn').value;
             if (ncorns >= 1 && game.diplomacy.get('leviathans').unlocked) {
@@ -3410,6 +3476,38 @@ SK.Scripts = class {
         }
     }
 
+    // A fixed, conservative policy path for short Paragon farming runs.
+    // Research at most one per pass, only after Solar Revolution.
+    paragonFarmPolicies() {
+        if (!game.libraryTab?.visible) return false;
+        sk.tasks.ensureContentExists('Science');
+        const policyNames = [
+            'liberty', 'republic', 'communism',
+            'diplomacy', 'knowledgeSharing',
+            'zebraRelationsAppeasement', 'sharkRelationsMerchants',
+            'griffinRelationsScouts', 'lizardRelationsPriests',
+            'nagaRelationsArchitects', 'dragonRelationsAstrologers',
+            'epicurianism', 'carnivale', 'rationality',
+            'stripMining', 'fullIndustrialization', 'outerSpaceTreaty'
+        ];
+        const buttons = game.libraryTab.policyPanel?.children || [];
+        for (const name of policyNames) {
+            const policy = game.science.getPolicy(name);
+            if (!policy?.unlocked || policy.researched || policy.blocked) continue;
+            if (policy.blocks?.some((blocked) => game.science.getPolicy(blocked)?.researched)) {
+                continue;
+            }
+            const button = buttons.find((item) => item.model?.metadata?.name === name);
+            if (!button?.model) continue;
+            if (!button.model.enabled) button.controller.updateEnabled(button.model);
+            if (!button.model.enabled) continue;
+            // Queue purchases intentionally skip the normal confirmation dialog.
+            const result = button.controller.buyItem(button.model, {boughtByQueue: true});
+            if (result?.itemBought || policy.researched) return true;
+        }
+        return false;
+    }
+
     // Auto Play configures existing automation modules once per progression stage.
     // Manual changes remain effective until the next stage transition or reset.
     paragonFarmConfigure(stage) {
@@ -3437,6 +3535,7 @@ SK.Scripts = class {
             conserveExotic: true, elderTrade: false, feed: false,
             program: false, autoFixCC: false, praiseAfter: false,
             observe: true, promote: stage === 'solar',
+            promoteKittens: stage === 'solar', autoFarmPolicies: true,
             autoStageUpgrades: true
         });
         Object.assign(this.model.option, {
@@ -3529,14 +3628,18 @@ SK.Scripts = class {
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
         // Apply this updated profile once on existing saves, not every tick.
-        if (state.stage !== stage || state.farmProfileVersion !== 4
+        if (state.stage !== stage || state.farmProfileVersion !== 5
                 || state.spaceProfileVersion !== 1) {
-            state.farmProfileVersion = 4;
+            state.farmProfileVersion = 5;
             state.spaceProfileVersion = 1;
             state.stage = stage;
             state.cappedSince = null;
             state.readyNotice = false;
             this.paragonFarmConfigure(stage);
+        }
+
+        if (stage === 'solar' && this.model.minor.autoFarmPolicies) {
+            this.paragonFarmPolicies();
         }
 
         // An explicit, narrow exception to configuration-only Auto Play:
