@@ -75,6 +75,11 @@ var SK = class {
             }
             this.model.load(options);
             this.scripts.load(options);
+            // The deleted legacy strategy must not execute on old saves.
+            if (this.model.option.script === 'fastParagon') {
+                this.model.option.script = 'none';
+                this.model.auto.play = false;
+            }
             // Only the explicitly selected Paragon Farm may resume after reload.
             // Both Auto Play and the reset permission retain their independent opt-ins.
             const resumeFarm = options.option?.script === 'paragonFarm'
@@ -128,6 +133,7 @@ SK.Model = class {
             permitReset: 'Permit Auto Play to Reset',
             ecoBuildings: 'Keep Bio Labs Off and Disable Pumpjacks',
             autoStageUpgrades: 'Auto Upgrade Bonfire Building Stages',
+            quietLogFilters: 'Only Festival and Elders Log Filters',
         };
 
         // These will allow quick selection of the buildings which consume energy
@@ -171,6 +177,7 @@ SK.Model = class {
             conserveExotic: true,
             ecoBuildings: true,
             autoStageUpgrades: true,
+            quietLogFilters: true,
             promoteKittens: false,
             autoFarmPolicies: false,
             partyLimit: 10,
@@ -559,6 +566,8 @@ SK.Tasks = class {
     }
 
     taskRunner() {
+        this.applyQuietLogFilters();
+        if (!this.checkParagonFarmKittenSafety()) return;
         if (game.isPaused) return; // we pause too
         const ticks = game.timer.ticksTotal;
         const previous = this.lastScheduledTick === undefined || ticks < this.lastScheduledTick
@@ -573,6 +582,86 @@ SK.Tasks = class {
                 task.override = this[task.fn](task.interval, task.override);
             }
         }
+    }
+
+    // Change displayed log categories without clearing existing log entries.
+    // Core game filters also prevent future filtered messages from being stored.
+    applyQuietLogFilters() {
+        if (!this.model.minor.quietLogFilters) return;
+        const now = Date.now();
+        if (this.lastQuietLogCheck && now - this.lastQuietLogCheck < 15000) return;
+        this.lastQuietLogCheck = now;
+        let changed = false;
+        for (const [name, filter] of Object.entries(game.console?.filters || {})) {
+            const allowed = name === 'festival' || name === 'elders';
+            if (filter.enabled !== allowed) {
+                filter.enabled = allowed;
+                changed = true;
+            }
+        }
+        if (changed) game.ui.renderFilters();
+    }
+
+    // Maintain a recent, definitely pre-death checkpoint. A snapshot captured
+    // AFTER the death would be useless for recovering the lost kitten.
+    checkParagonFarmKittenSafety() {
+        const farming = this.model.auto.play && this.model.option.script === 'paragonFarm';
+        if (!farming) {
+            this.paragonSafety = null;
+            return true;
+        }
+        const deaths = Number(game.deadKittens || 0);
+        const now = Date.now();
+        if (!this.paragonSafety || deaths < this.paragonSafety.deaths) {
+            this.paragonSafety = {deaths, snapshot: null, savedAt: 0};
+        }
+        const safety = this.paragonSafety;
+        if (deaths > safety.deaths) {
+            // Stop all automation and pause the simulation before initiating
+            // a download. Browser permissions may still block scripted saves.
+            for (const name of Object.keys(this.model.auto)) this.model.auto[name] = false;
+            this.scripts.farmState = null;
+            game.time.isAccelerated = false;
+            if (!game.isPaused) game.togglePause();
+            this.halt();
+            sk.saveOptions();
+            sk.gui.refresh();
+            game.msg(`Paragon Farm stopped: ${deaths - safety.deaths} kitten(s) died. Game paused.`, 'important');
+            if (safety.snapshot) {
+                try {
+                    const blob = new Blob([safety.snapshot], {type: 'text/plain'});
+                    const url = window.URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'Kittens Game - before kitten death - '
+                        + new Date(safety.savedAt).toISOString().replace(/[:.]/g, '-') + '.txt';
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    setTimeout(() => window.URL.revokeObjectURL(url), 60000);
+                } catch (error) {
+                    console.error('Unable to download pre-death save:', error);
+                    game.msg('Pre-death save download failed. Check browser permissions.', 'important');
+                }
+            } else {
+                game.msg('No pre-death save snapshot was available.', 'important');
+            }
+            return false;
+        }
+        if (!safety.snapshot || now - safety.savedAt >= 30000) {
+            try {
+                // Uses the same save and compression format as game.saveToFile().
+                const before = game.deadKittens;
+                const encoded = game.compressLZData(JSON.stringify(game.save()));
+                if (game.deadKittens === before) {
+                    safety.snapshot = encoded;
+                    safety.savedAt = now;
+                }
+            } catch (error) {
+                console.error('Unable to create pre-death checkpoint:', error);
+            }
+        }
+        return true;
     }
 
     // Show current kitten efficiency in the in-game log
@@ -2305,8 +2394,7 @@ SK.Scripts = class {
     static listScripts() {
         return [ // format is chosen to match things like game.calendar.cycles
             {name:'test',        title:'Test Script'},
-            {name:'paragonFarm', title:'Safe Paragon Farm'},
-            {name:'fastParagon', title:'Fast Paragon (legacy)'},
+            {name:'paragonFarm', title:'Paragon Farm'},
             {name:'slowloop',    title:'DF ChronoExpo'},
             {name:'fastloop',    title:'Short ChronoExpo'},
             {name:'hoglaHunt',   title:'Hoglagame - Hunt'},
@@ -2864,186 +2952,6 @@ SK.Scripts = class {
             default:
                 // is mostly the same a slow, but we stop and reset instead of waiting for DF.
                 return this.slowloop(action);
-        }
-    }
-
-    fastParagon(action) {
-        // Goal: 5 chronospheres, Flux Condenator, Eludium Huts
-        // Estimate of ~1000 paragon per hour.
-        switch (action) {
-            case 'init': // -> build-start, build-upgrade, workshop-mid, trade-zebras, trade-hunt, policy
-                this.model.auto.explore = true;
-                this.model.auto.hunt = true;
-                this.model.auto.party = true;
-                this.model.auto.research = true;
-                this.model.auto.unicorn = true;
-                this.model.auto.workshop = true;
-                this.model.option.minSecResRatio = 10; // more alloy
-                this.model.minor.program = 1000; // starchart<=1000: orbit,moon,dune,piscine
-                this.model.minor.feed = true;
-                this.model.minor.promote = true;
-                this.model.minor.praiseAfter = true;
-                this.state.push('build-start');
-                this.state.push('build-upgrade');
-                this.state.push('workshop-mid');
-                this.state.push('trade-zebras');
-                this.state.push('policy');
-                return true;
-
-            case 'build-start': // -> religion, steamworks, pop-max-cath
-                /** cath **/
-                for (const bname in this.model.cathBuildings) {
-                    let limit = false;
-                    switch (bname) {
-                        case 'oilWell': case 'quarry': case 'harbor': case 'amphitheatre': case 'calciner':
-                            limit = 100;
-                            break;
-                        case 'warehouse': case 'observatory': case 'lumberMill':
-                            limit = 200;
-                            break;
-                        case 'chronosphere':
-                            limit = 5;
-                            break;
-                        case 'biolab': case 'mint': case 'ziggurat': case 'aiCore':
-                        case 'zebraForge': case 'zebraOutpost': case 'zebraWorkshop':
-                            continue; // don't enable
-                    }
-                    this.model.cathBuildings[bname].enabled = true;
-                    if (limit) this.model.cathBuildings[bname].limit = limit;
-                }
-                /** space **/
-                var slimit = {
-                    spaceElevator: 5, sattelite: false, moonOutpost: false,
-                    hydrofracturer: 10, spiceRefinery: 10,
-                    researchVessel: 40,
-                };
-                for (const bname in slimit) {
-                    this.model.spaceBuildings[bname].enabled = true;
-                    this.model.spaceBuildings[bname].limit = slimit[bname];
-                }
-                /** turn it on **/
-                this.model.auto.build = true;
-                this.model.auto.assign = true;
-                /** children **/
-                this.state.push('religion');
-                this.state.push('steamworks');
-                this.state.push('pop-max-cath');
-                return true;
-
-            case 'build-upgrade': // -|
-                var upgrades = ['pasture', 'amphitheatre'];
-                if (this.singleUpgrade(upgrades)) {
-                    this.model.auto.craft = true; // we should be in far enough for this to make sense
-                    return true;
-                }
-                return false;
-
-            case 'workshop-start': // -> workshop-mid
-                var requiredWorkshop = ['railgun', 'concreteHuts', 'caravanserai', 'orbitalGeodesy', 'seti', 'cadSystems', 'hubbleTelescope'];
-                for (const upgrade of requiredWorkshop) {
-                    if (! game.workshop.get(upgrade).researched) return false;
-                }
-                this.model.auto.workshop = false;
-                this.state.push('workshop-mid');
-                return true;
-
-            case 'workshop-mid': // -> workshop-end
-                var extraWorkshop = ['spaceManufacturing', 'factoryLogistics', 'unobtainiumHuts'];
-                if (this.singleTech(game.workshopTab.buttons, extraWorkshop)) {
-                    this.state.push('workshop-end');
-                    return true;
-                }
-                return false;
-
-            case 'workshop-end': // -|
-                var finalWorkshop = ['mWReactor', 'eludiumHuts', 'fluxCondensator'];
-                this.craftFor(game.workshop, finalWorkshop);
-                if (this.singleTech(game.workshopTab.buttons, finalWorkshop)) {
-                    return true;
-                }
-                return false;
-
-            case 'religion': // -|
-                sk.tasks.ensureContentExists('Religion'); // create button
-                if (this.singleTech(game.religionTab.rUpgradeButtons, ['solarRevolution'])) {
-                    this.model.auto.religion = true;
-                    return true;
-                }
-                return false;
-
-            case 'steamworks': // -|
-                if (game.bld.get('steamworks').val !== 0) {
-                    game.bld.get('steamworks').on = game.bld.get('steamworks').val;
-                    game.bld.get('steamworks').isAutomationEnabled = false;
-                    return true;
-                } else {
-                    return false;
-                }
-
-            case 'policy': // -|
-                var policies = [
-                    'liberty', 'republic', 'liberalism',
-                    'diplomacy', 'culturalExchange', 'zebraRelationsBellicosity',
-                    'outerSpaceTreaty', 'expansionism', 'necrocracy',
-                    'epicurianism', 'mysticism',
-                    'environmentalism', 'conservation',
-                ];
-                return this.singleTech(game.libraryTab.policyPanel.children, policies);
-
-            case 'trade-zebras': // -|
-                var zebraPanel = game.diplomacyTab?.racePanels?.find((panel) => panel.race.name==='zebras');
-                if (!zebraPanel) return false;
-                sk.tasks.buyItem(zebraPanel.embassyButton, {shiftKey:true});
-                this.model.auto.embassy = true;
-                this.model.auto.trade = true;
-                return true;
-
-            case 'pop-max-cath': // -> pop-max-space
-                var cathKittens = game.resPool.get('kittens');
-                if (cathKittens.value === cathKittens.maxValue) {
-                    this.model.cathBuildings.magneto.enabled = false; // conserve alloy for stations
-                    this.model.spaceBuildings.spaceStation.enabled = true;
-                    this.model.auto.religion = false; // start accumulating faith
-                    this.model.auto.praise = false;
-                    this.state.push('pop-max-space');
-                    return true;
-                }
-                return false;
-
-            case 'pop-max-space': // -> endgame-stockpile
-                var spaceKittens = game.resPool.get('kittens');
-                // We want more than five space stations, but once we have a few,
-                // we will build them faster than we fill them. Just need to
-                // prime the pump
-                if (spaceKittens.value >= spaceKittens.maxValue
-                    && game.bld.get('chronosphere').val >= 5
-                    && game.space.getBuilding('spaceStation').val >= 5
-                    && game.workshop.get('fluxCondensator').researched) {
-                    // disable auto tech,
-                    for (const auto in this.model.auto) {
-                        if (auto !== 'play') this.model.auto[auto] = false;
-                        game.time.isAccelerated = false;
-                    }
-                    this.state.push('endgame-stockpile');
-                    return true;
-                }
-                return false;
-
-            case 'endgame-stockpile': // -> endgame-reset!
-                // wait for culture to cap, this usually doesn't take long, but
-                // gives us enough time to hoard resources for the reset
-                var culture = game.resPool.get('culture');
-                if (culture.value >= culture.maxValue) {
-                    this.reset();
-                    return true;
-                }
-                return false;
-
-            default:
-                this.model.auto.play = false;
-                console.log(`CRITICAL: unrecognized state ${action}`);
-                game.msg(`CRITICAL: unrecognized state ${action}`);
-                return true; // to cause refresh
         }
     }
 
@@ -3719,6 +3627,110 @@ SK.Scripts = class {
         return this.paragonFarmIsPriceCapped(prices);
     }
 
+    // Once the normal reset criteria are met, run a short, persistent ritual.
+    // Other automation remains disabled throughout this process.
+    paragonFarmPrepareReset(state) {
+        for (const name of Object.keys(this.model.auto)) {
+            if (name !== 'play') this.model.auto[name] = false;
+        }
+        // Disable action toggles without destroying numeric configuration
+        // such as the festival party limit or saved resource preferences.
+        const minorTasks = [
+            'program', 'observe', 'feed', 'promote', 'promoteKittens',
+            'autoFarmPolicies', 'autoStageUpgrades', 'unicornIvory',
+            'lowCatnipTrade', 'elderTrade', 'autoFixCC', 'praiseAfter'
+        ];
+        for (const name of minorTasks) this.model.minor[name] = false;
+        game.time.isAccelerated = false;
+
+        const next = (step) => {
+            state.resetPrep = step;
+            sk.saveOptions();
+            return false;
+        };
+        if (state.resetPrep === 'stop') {
+            sk.gui.refresh();
+            return next('unicorns');
+        }
+
+        if (state.resetPrep === 'unicorns') {
+            if (game.bld.get('ziggurat')?.on > 0 && game.religionTab?.visible) {
+                sk.tasks.ensureContentExists('Religion');
+                const button = game.religionTab.sacrificeBtn;
+                const amount = button?.controller?.getCanAfford(button.model) || 0;
+                if (amount > 0) button.controller._transform(button.model, amount);
+            }
+            return next('build');
+        }
+
+        if (state.resetPrep === 'build') {
+            if (game.bld.get('ziggurat')?.on > 0 && game.religionTab?.visible) {
+                sk.tasks.ensureContentExists('Religion');
+                let bought = false;
+                // Alternate between the two buildings rather than spending all
+                // Tears on only one. Stop after a bounded batch per tick.
+                for (let i = 0; i < 40; ++i) {
+                    let thisRound = false;
+                    for (const name of ['sunspire', 'unicornUtopia']) {
+                        const meta = game.religion.getZU(name);
+                        if (!meta?.unlocked) continue;
+                        const button = game.religionTab.zgUpgradeButtons?.find((b) => b.id === name);
+                        if (!button?.model) continue;
+                        if (!button.model.enabled) button.controller.updateEnabled(button.model);
+                        if (button.model.enabled && sk.tasks.buyItem(button)) {
+                            thisRound = true;
+                            bought = true;
+                        }
+                    }
+                    if (!thisRound) break;
+                }
+                if (bought) return false; // Re-check current prices next tick.
+            }
+            return next('alicorns');
+        }
+
+        if (state.resetPrep === 'alicorns') {
+            if (game.bld.get('ziggurat')?.on > 0 && game.religionTab?.visible) {
+                sk.tasks.ensureContentExists('Religion');
+                const button = game.religionTab.sacrificeAlicornsBtn;
+                const amount = button?.controller?.getCanAfford(button.model) || 0;
+                if (amount > 0) button.controller._transform(button.model, amount);
+            }
+            return next('adore');
+        }
+
+        if (state.resetPrep === 'adore') {
+            // Gather remaining Faith before converting accumulated Worship.
+            if (game.resPool.get('faith')?.value > 0) game.religion.praise();
+            if (game.religion.getRU('apocripha')?.on > 0 && game.religion.faith > 0) {
+                game.religion.resetFaith(1.01, false);
+            }
+            return next('reset');
+        }
+
+        if (state.resetPrep !== 'reset') {
+            console.error('Unknown Paragon Farm reset preparation step:', state.resetPrep);
+            this.model.auto.play = false;
+            sk.saveOptions();
+            return false;
+        }
+
+        // The original reset conditions have already been checked. The ritual
+        // can only run after the explicit auto-reset permission was granted.
+        if (!this.model.minor.permitReset) return false;
+        this.farmState = null;
+        sk.saveOptions();
+        sk.tasks.halt();
+        const previousConfirm = game.ui.confirm;
+        try {
+            game.ui.confirm = (title, message, yes) => yes();
+            game.reset();
+        } finally {
+            game.ui.confirm = previousConfirm;
+        }
+        return false;
+    }
+
     paragonFarm() {
         if (!this.model.auto.play || this.model.option.script !== 'paragonFarm') return false;
 
@@ -3739,6 +3751,7 @@ SK.Scripts = class {
             this.farmState = {startedAt: now, stage: null, cappedSince: null, readyNotice: false};
         }
         const state = this.farmState;
+        if (state.resetPrep) return this.paragonFarmPrepareReset(state);
         const theology = Boolean(game.science.get('theology')?.researched);
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
@@ -3835,19 +3848,11 @@ SK.Scripts = class {
             return false;
         }
 
-        // Persist the user's two opt-ins, but start a new configuration/run
-        // window after the next page load. No mass-selling or rare spending.
-        this.farmState = null;
+        // Freeze all normal automation before any religious sacrifices or
+        // Adore. Each step is persisted so page reloads can resume safely.
+        state.resetPrep = 'stop';
         sk.saveOptions();
-        sk.tasks.halt();
-        const previousConfirm = game.ui.confirm;
-        try {
-            game.ui.confirm = (title, message, yes) => yes();
-            game.reset();
-        } finally {
-            game.ui.confirm = previousConfirm;
-        }
-        return false;
+        return this.paragonFarmPrepareReset(state);
     }
 
     doReset(action) {
