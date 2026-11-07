@@ -134,6 +134,7 @@ SK.Model = class {
             ecoBuildings: 'Keep Bio Labs Off and Disable Pumpjacks',
             autoStageUpgrades: 'Auto Upgrade Bonfire Building Stages',
             quietLogFilters: 'Only Festival and Elders Log Filters',
+            buildFiveChronospheres: 'Build 5 Chronospheres (keep >1000 TC)',
         };
 
         // These will allow quick selection of the buildings which consume energy
@@ -178,6 +179,7 @@ SK.Model = class {
             ecoBuildings: true,
             autoStageUpgrades: true,
             quietLogFilters: true,
+            buildFiveChronospheres: false,
             promoteKittens: false,
             autoFarmPolicies: false,
             partyLimit: 10,
@@ -542,6 +544,7 @@ SK.Tasks = class {
             {fn:'autoAssign',   interval:20, offset:3,   override:false},
             {fn:'autoResearch', interval:20, offset:7,   override:false},
             {fn:'autoWorkshop', interval:20, offset:9,   override:false},
+            {fn:'autoChronospheres',interval:20, offset:15, override:false},
             {fn:'autoReligion', interval:20, offset:11,  override:false},
             {fn:'autoTrade',    interval:20, offset:13,  override:false},
             {fn:'autoShatter',  interval:20, offset:17,  override:false},
@@ -569,11 +572,15 @@ SK.Tasks = class {
         this.applyQuietLogFilters();
         if (!this.checkParagonFarmKittenSafety()) return;
         if (game.isPaused) return; // we pause too
+        const farmBusy = this.model.auto.play && this.model.option.script === 'paragonFarm'
+            && (this.scripts.farmState?.bootstrap || this.scripts.farmState?.resetPrep
+                || (!this.scripts.farmState && this.scripts.paragonFarmBootstrapCandidate()));
         const ticks = game.timer.ticksTotal;
         const previous = this.lastScheduledTick === undefined || ticks < this.lastScheduledTick
             ? ticks - 1 : this.lastScheduledTick;
         this.lastScheduledTick = ticks;
         for (const task of this.schedule) {
+            if (farmBusy && task.fn !== 'autoPlay' && task.fn !== 'autoSave') continue;
             // Run once when the scheduled tick was crossed, even if the browser
             // delayed our timer callback while this tab was in the background.
             const due = Math.floor((ticks - task.offset) / task.interval)
@@ -662,6 +669,73 @@ SK.Tasks = class {
             }
         }
         return true;
+    }
+
+    // Conservative forecast of all remaining Chronosphere and Flux Condensator
+    // Time Crystal costs. A null result disables this opt-in mode safely.
+    chronosphereTCBudget() {
+        const chrono = game.bld.get('chronosphere');
+        const tc = game.resPool.get('timeCrystal');
+        const flux = game.workshop.get('fluxCondensator');
+        if (!chrono || !tc || !flux) return null;
+        const remaining = Math.max(0, 5 - chrono.val);
+        let cost = 0;
+        // The game's additionalBought argument computes the exact price at
+        // each future count, including policies and price reductions.
+        for (let i = 0; i < remaining; ++i) {
+            const price = game.bld.getPrices('chronosphere', i)?.find((p) =>
+                p.name === 'timeCrystal')?.val;
+            if (!(price >= 0) || !Number.isFinite(price)) return null;
+            cost += price;
+        }
+        if (!flux.researched) {
+            cost += (flux.prices || []).find((p) => p.name === 'timeCrystal')?.val || 0;
+        }
+        // Chronophysics itself spends 5 TC and is blocked by Conserve Exotic.
+        const chronophysics = game.science.get('chronophysics');
+        if (!chronophysics) return null;
+        if (!chronophysics.researched) {
+            cost += (chronophysics.prices || []).find((p) => p.name === 'timeCrystal')?.val || 0;
+        }
+        return tc.value > 1000 + cost ? cost : null;
+    }
+
+    // Minor Option: deliberately bypass Conserve Exotic only for these two
+    // purchases, never spending enough Time Crystals to fall to 1000 or below.
+    autoChronospheres() {
+        if (!this.model.minor.buildFiveChronospheres) return false;
+        if (this.model.auto.play && this.model.option.script === 'paragonFarm'
+                && !this.scripts.farmState?.chronoRun) return false;
+        if (this.chronosphereTCBudget() === null) return false;
+        const chronophysics = game.science.get('chronophysics');
+        if (!chronophysics.researched) {
+            if (!chronophysics.unlocked || chronophysics.blocked) return false;
+            this.ensureContentExists('Science');
+            const button = game.libraryTab.buttons.find((item) =>
+                item.model?.metadata?.name === 'chronophysics');
+            if (!button?.model) return false;
+            if (!button.model.visible) button.controller.updateVisible(button.model);
+            if (!button.model.enabled) button.controller.updateEnabled(button.model);
+            return Boolean(button.model.visible && button.model.enabled && this.buyItem(button));
+        }
+        const chrono = game.bld.get('chronosphere');
+        if (chrono.val < 5) {
+            if (!chrono.unlocked || !this.canBuildWithEnergy(chrono)) return false;
+            const button = sk.bldTabChildren().find((item) =>
+                item.model?.metadata?.name === 'chronosphere');
+            if (!button?.model) return false;
+            if (!button.model.enabled) button.controller.updateEnabled(button.model);
+            return Boolean(button.model.enabled && this.buyItem(button));
+        }
+        const flux = game.workshop.get('fluxCondensator');
+        if (!flux?.unlocked || flux.researched || flux.blocked) return false;
+        this.ensureContentExists('Workshop');
+        const button = game.workshopTab.buttons.find((item) =>
+            item.model?.metadata?.name === 'fluxCondensator');
+        if (!button?.model) return false;
+        if (!button.model.visible) button.controller.updateVisible(button.model);
+        if (!button.model.enabled) button.controller.updateEnabled(button.model);
+        return Boolean(button.model.visible && button.model.enabled && this.buyItem(button));
     }
 
     // Show current kitten efficiency in the in-game log
@@ -3424,6 +3498,184 @@ SK.Scripts = class {
         }
     }
 
+    // The resource-carryover run gets a single manual economic bootstrap.
+    // Once ordinary buildings exist, reloading never repeats this sequence.
+    paragonFarmBootstrapCandidate() {
+        return Boolean(this.model.minor.buildFiveChronospheres
+            && sk.tasks.chronosphereTCBudget() !== null
+            && game.resPool.get('titanium')?.value > 0
+            && Array.isArray(game.bld.buildingsData)
+            && game.bld.buildingsData.every((building) => !(building.val > 0)));
+    }
+
+    paragonFarmBootstrapBuy(name, reserveGold = false) {
+        const building = game.bld.get(name);
+        if (!building?.unlocked) return false;
+        const button = sk.bldTabChildren().find((item) =>
+            item.model?.metadata?.name === name);
+        if (!button?.model) return false;
+        if (!button.model.enabled) button.controller.updateEnabled(button.model);
+        const prices = button.model.prices || game.bld.getPrices(name) || [];
+        if (reserveGold && !game.religion.getRU('solarRevolution')?.on) {
+            const goldCost = prices.find((price) => price.name === 'gold')?.val || 0;
+            if (game.resPool.get('gold').value - goldCost < 500) return false;
+        }
+        const tasks = sk.tasks;
+        const meta = button.model.metadata;
+        const converterInputs = tasks.converterInputs(meta);
+        const budget = tasks.converterBudget();
+        if (!button.model.enabled || !tasks.canSpendCatnipOnBuilding(button)
+                || !tasks.canBuildWithEnergy(meta)
+                || !tasks.canBuildConverter(converterInputs, budget)) return false;
+        return Boolean(tasks.buyItem(button));
+    }
+
+    // Each step is persisted. No normal automation runs until bootstrap ends.
+    paragonFarmBootstrap(state) {
+        // Keep farming food while the start-of-run automation is gated.
+        if (game.village.sim.kittens.length) sk.tasks.ensureCatnipSurplus();
+        if (game.ui.activeTabId !== 'Bonfire') {
+            game.ui.activeTabId = 'Bonfire';
+            game.render();
+        }
+        const advance = (next) => {
+            state.bootstrap = next;
+            sk.saveOptions();
+            return false;
+        };
+        if (state.bootstrap === 'science') {
+            if (game.libraryTab?.visible) {
+                sk.tasks.ensureContentExists('Science');
+                const buttons = game.libraryTab.buttons || [];
+                for (const button of buttons) {
+                    const tech = button.model?.metadata;
+                    if (!tech?.unlocked || tech.researched || tech.blocked) continue;
+                    const prices = button.model.prices || tech.prices || [];
+                    if (prices.some((p) => this.model.exoticResources.includes(p.name))) continue;
+                    if (!button.model.enabled) button.controller.updateEnabled(button.model);
+                    if (button.model.enabled && sk.tasks.buyItem(button)) return false;
+                }
+            }
+            return advance('fields');
+        }
+        if (['fields', 'barns', 'temples', 'housing'].includes(state.bootstrap)) {
+            const names = state.bootstrap === 'fields' ? ['field']
+                : state.bootstrap === 'barns' ? ['barn']
+                : state.bootstrap === 'temples' ? ['temple'] : ['hut', 'logHouse'];
+            let bought = false;
+            // Bound each pass to avoid freezing the browser on large carryovers.
+            for (let i = 0; i < 80; ++i) {
+                let round = false;
+                for (const name of names) {
+                    if (name === 'barn' && game.bld.get('barn').val >= 10) continue;
+                    if (this.paragonFarmBootstrapBuy(name, name === 'temple')) {
+                        round = true;
+                        bought = true;
+                    }
+                }
+                if (!round) break;
+            }
+            if (bought) return false;
+            return advance(state.bootstrap === 'fields' ? 'barns'
+                : state.bootstrap === 'barns' ? 'temples'
+                : state.bootstrap === 'temples' ? 'solar' : 'upgrades');
+        }
+        if (state.bootstrap === 'solar') {
+            if (game.religionTab?.visible && game.science.get('theology')?.researched) {
+                sk.tasks.ensureContentExists('Religion');
+                this.singleTech(game.religionTab.rUpgradeButtons, ['solarRevolution']);
+            }
+            return advance('housing');
+        }
+        if (state.bootstrap === 'upgrades') {
+            const priorities = [
+                'ironwood', 'coalFurnace', 'oxidation', 'rotaryKiln',
+                'factoryOptimization', 'miningDrill', 'photovoltaic',
+                'concreteHuts', 'spaceManufacturing'
+            ];
+            if (game.workshopTab?.visible) {
+                sk.tasks.ensureContentExists('Workshop');
+                for (const name of priorities) {
+                    const upgrade = game.workshop.get(name);
+                    if (!upgrade?.unlocked || upgrade.researched || upgrade.blocked) continue;
+                    if ((upgrade.prices || []).some((p) =>
+                            this.model.exoticResources.includes(p.name))) continue;
+                    const button = game.workshopTab.buttons.find((item) =>
+                        item.model?.metadata?.name === name);
+                    if (!button?.model) continue;
+                    if (!button.model.enabled) button.controller.updateEnabled(button.model);
+                    if (!button.model.visible) button.controller.updateVisible(button.model);
+                    if (button.model.enabled && button.model.visible
+                            && sk.tasks.buyItem(button)) return false;
+                }
+            }
+            return advance('stages');
+        }
+        if (state.bootstrap === 'stages') {
+            if (this.model.minor.autoStageUpgrades) {
+                for (const name of ['pasture', 'aqueduct', 'amphitheatre', 'library']) {
+                    if (this.model.cathBuildings[name]) this.model.cathBuildings[name].enabled = true;
+                }
+                if (sk.tasks.autoUpgradeBonfireStages()) return false;
+            }
+            state.bootstrapRounds = 0;
+            return advance('production');
+        }
+        if (state.bootstrap === 'production') {
+            const names = [
+                'workshop', 'pasture', 'aqueduct', 'mine', 'lumberMill',
+                'quarry', 'steamworks', 'magneto', 'reactor', 'smelter',
+                'calciner', 'accelerator', 'factory', 'observatory',
+                'academy', 'warehouse'
+            ];
+            let built = false;
+            for (let pass = 0; pass < 3 && state.bootstrapRounds < 24; ++pass) {
+                let round = false;
+                for (const name of names) {
+                    if (this.paragonFarmBootstrapBuy(name)) {
+                        round = true;
+                        built = true;
+                    }
+                }
+                state.bootstrapRounds += 1;
+                if (!round) break;
+            }
+            if (built && state.bootstrapRounds < 24) return false;
+            return advance('done');
+        }
+        // Resume the regular cascading Auto Play profile on the next pass.
+        state.bootstrap = null;
+        state.stage = null;
+        state.phase = null;
+        sk.saveOptions();
+        return false;
+    }
+
+    // Trade incoming Elders for TC, but reserve resources for Chronospheres.
+    // No forced Elder trade is possible after reset preparation starts.
+    paragonFarmTradeElders(state) {
+        if (!state.chronoRun || !this.model.minor.buildFiveChronospheres
+                || state.resetPrep || !game.workshop.get('eludiumHuts')?.researched) return false;
+        const elders = game.diplomacy.get('leviathans');
+        if (!elders?.unlocked || !(elders.duration > 0)) return false;
+        const unobtainium = game.resPool.get('unobtainium');
+        const tradeVolume = game.diplomacy.getTradeVolume();
+        const unitCost = elders.buys.find((price) => price.name === 'unobtainium')?.val * tradeVolume;
+        if (!(unitCost > 0)) return false;
+        let reserve = game.workshop.get('fluxCondensator')?.researched ? 0 : 5000;
+        if (game.bld.get('chronosphere')?.val < 5) {
+            reserve += game.bld.getPrices('chronosphere')?.find((p) =>
+                p.name === 'unobtainium')?.val || 0;
+        }
+        const available = Math.floor(Math.max(0, unobtainium.value - reserve) / unitCost);
+        const trades = Math.min(100, available, game.diplomacy.getMaxTradeAmt(elders));
+        if (trades > 0) {
+            game.diplomacy.tradeMultiple(elders, trades);
+            return true;
+        }
+        return false;
+    }
+
     // A fixed, conservative policy path for short Paragon farming runs.
     // Research at most one per pass, only after Solar Revolution.
     paragonFarmPolicies() {
@@ -3479,13 +3731,13 @@ SK.Scripts = class {
     paragonFarmBuyFocusedUpgrade() {
         const upgrade = this.paragonFarmPendingUpgrade();
         if (!upgrade?.unlocked || upgrade.blocked) return false;
-        this.ensureContentExists('Workshop');
+        sk.tasks.ensureContentExists('Workshop');
         const button = game.workshopTab?.buttons?.find((item) =>
             item.model?.metadata?.name === upgrade.name);
         if (!button?.model) return false;
         if (!button.model.enabled) button.controller.updateEnabled(button.model);
         if (!button.model.visible) button.controller.updateVisible(button.model);
-        return Boolean(button.model.enabled && button.model.visible && this.buyItem(button));
+        return Boolean(button.model.enabled && button.model.visible && sk.tasks.buyItem(button));
     }
 
     // Optional upgrades use spare resources and never gate the finishing
@@ -3505,7 +3757,7 @@ SK.Scripts = class {
             'unobtainiumAxe',
             'unobtainiumSaw'
         ];
-        this.ensureContentExists('Workshop');
+        sk.tasks.ensureContentExists('Workshop');
         const buttons = game.workshopTab?.buttons || [];
         for (const name of optional) {
             const upgrade = game.workshop.get(name);
@@ -3517,7 +3769,7 @@ SK.Scripts = class {
             if (!button.model.visible) button.controller.updateVisible(button.model);
             if (!button.model.enabled) button.controller.updateEnabled(button.model);
             if (!button.model.visible || !button.model.enabled) continue;
-            if (this.buyItem(button)) return true;
+            if (sk.tasks.buyItem(button)) return true;
         }
         return false;
     }
@@ -3650,6 +3902,13 @@ SK.Scripts = class {
         };
         if (state.resetPrep === 'stop') {
             sk.gui.refresh();
+            return next(state.chronoRun && this.model.minor.buildFiveChronospheres
+                ? 'stockpile' : 'unicorns');
+        }
+
+        if (state.resetPrep === 'stockpile') {
+            const uno = game.resPool.get('unobtainium');
+            if (uno?.maxValue > 0 && uno.value < uno.maxValue * (1 - 1e-8)) return false;
             return next('unicorns');
         }
 
@@ -3751,7 +4010,19 @@ SK.Scripts = class {
             this.farmState = {startedAt: now, stage: null, cappedSince: null, readyNotice: false};
         }
         const state = this.farmState;
+        if (state.chronoRun === undefined) {
+            state.chronoRun = Boolean(this.model.minor.buildFiveChronospheres
+                && sk.tasks.chronosphereTCBudget() !== null);
+            if (state.chronoRun && this.paragonFarmBootstrapCandidate()) {
+                state.bootstrap = 'science';
+                for (const name of Object.keys(this.model.auto)) {
+                    if (name !== 'play') this.model.auto[name] = false;
+                }
+            }
+            sk.saveOptions();
+        }
         if (state.resetPrep) return this.paragonFarmPrepareReset(state);
+        if (state.bootstrap) return this.paragonFarmBootstrap(state);
         const theology = Boolean(game.science.get('theology')?.researched);
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
@@ -3822,12 +4093,21 @@ SK.Scripts = class {
             if (trades > 0) game.diplomacy.tradeMultiple(zebras, trades);
         }
 
+        // Use surplus Unobtainium for Elder trading while the run is active.
+        // Trading stops as soon as reset preparation begins.
+        this.paragonFarmTradeElders(state);
+
         // Never reset for elapsed time, temporarily low marginal growth, or
         // "almost full" kittens. All four housing types must be truly capped.
         const kittens = game.resPool.get('kittens');
         const populationFull = kittens?.maxValue > 0
             && kittens.value >= kittens.maxValue - 1e-8;
-        const capped = solar && populationFull && this.paragonFarmHousingCapped();
+        const chronoRequired = state.chronoRun && this.model.minor.buildFiveChronospheres;
+        const chronoReady = !chronoRequired || (game.bld.get('chronosphere')?.val >= 5
+            && game.workshop.get('fluxCondensator')?.researched
+            && game.calendar.year >= 5);
+        const capped = solar && populationFull && chronoReady
+            && this.paragonFarmHousingCapped();
         if (!capped) {
             state.cappedSince = null;
             state.readyNotice = false;
