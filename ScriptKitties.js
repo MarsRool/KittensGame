@@ -671,37 +671,25 @@ SK.Tasks = class {
         return true;
     }
 
-    // Conservative forecast of all remaining Chronosphere and Flux Condensator
-    // Time Crystal costs. A null result disables this opt-in mode safely.
+    // Fixed TC costs for the FIRST five Chronospheres (base ratio 1.25).
+    // Existing Chronospheres count toward the goal, even when built manually.
+    // Flux Condensator and, if necessary, Chronophysics cost 5 TC each.
     chronosphereTCBudget() {
         const chrono = game.bld.get('chronosphere');
         const tc = game.resPool.get('timeCrystal');
         const flux = game.workshop.get('fluxCondensator');
-        if (!chrono || !tc || !flux) return null;
-        const remaining = Math.max(0, 5 - chrono.val);
-        let cost = 0;
-        // The game's additionalBought argument computes the exact price at
-        // each future count, including policies and price reductions.
-        for (let i = 0; i < remaining; ++i) {
-            const price = game.bld.getPrices('chronosphere', i)?.find((p) =>
-                p.name === 'timeCrystal')?.val;
-            if (!(price >= 0) || !Number.isFinite(price)) return null;
-            cost += price;
-        }
-        if (!flux.researched) {
-            cost += (flux.prices || []).find((p) => p.name === 'timeCrystal')?.val || 0;
-        }
-        // Chronophysics itself spends 5 TC and is blocked by Conserve Exotic.
         const chronophysics = game.science.get('chronophysics');
-        if (!chronophysics) return null;
-        if (!chronophysics.researched) {
-            cost += (chronophysics.prices || []).find((p) => p.name === 'timeCrystal')?.val || 0;
-        }
+        if (!chrono || !tc || !flux || !chronophysics) return null;
+        const firstFiveCosts = [1, 1.25, 1.5625, 1.953125, 2.44140625];
+        const owned = Math.min(5, Math.max(0, Math.floor(chrono.val)));
+        const remainingCost = firstFiveCosts.slice(owned).reduce((sum, value) => sum + value, 0);
+        const cost = remainingCost + (flux.researched ? 0 : 5)
+            + (chronophysics.researched ? 0 : 5);
         return tc.value > 1000 + cost ? cost : null;
     }
 
-    // Minor Option: deliberately bypass Conserve Exotic only for these two
-    // purchases, never spending enough Time Crystals to fall to 1000 or below.
+    // Minor Option: allow only Chronophysics, the first five Chronospheres
+    // and Flux Condensator to spend TC, preserving more than 1000 TC.
     autoChronospheres() {
         if (!this.model.minor.buildFiveChronospheres) return false;
         if (this.model.auto.play && this.model.option.script === 'paragonFarm'
@@ -718,6 +706,9 @@ SK.Tasks = class {
             if (!button.model.enabled) button.controller.updateEnabled(button.model);
             return Boolean(button.model.visible && button.model.enabled && this.buyItem(button));
         }
+        // Delay spending TC and Unobtainium on Chronospheres / Flux Condensator
+        // until Eludium Huts is researched. Chronophysics may be bought earlier.
+        if (!game.workshop.get('eludiumHuts')?.researched) return false;
         const chrono = game.bld.get('chronosphere');
         if (chrono.val < 5) {
             if (!chrono.unlocked || !this.canBuildWithEnergy(chrono)) return false;
@@ -3498,8 +3489,9 @@ SK.Scripts = class {
         }
     }
 
-    // The resource-carryover run gets a single manual economic bootstrap.
-    // Once ordinary buildings exist, reloading never repeats this sequence.
+    // Bootstrap only at the beginning of an eligible carryover run: Titanium
+    // must already exist, and no Bonfire building may have been constructed.
+    // Existing in-progress bootstrap states continue across page reloads.
     paragonFarmBootstrapCandidate() {
         return Boolean(this.model.minor.buildFiveChronospheres
             && sk.tasks.chronosphereTCBudget() !== null
@@ -3578,14 +3570,14 @@ SK.Scripts = class {
             if (bought) return false;
             return advance(state.bootstrap === 'fields' ? 'barns'
                 : state.bootstrap === 'barns' ? 'temples'
-                : state.bootstrap === 'temples' ? 'solar' : 'upgrades');
+                : state.bootstrap === 'temples' ? 'solar' : 'production');
         }
         if (state.bootstrap === 'solar') {
             if (game.religionTab?.visible && game.science.get('theology')?.researched) {
                 sk.tasks.ensureContentExists('Religion');
                 this.singleTech(game.religionTab.rUpgradeButtons, ['solarRevolution']);
             }
-            return advance('housing');
+            return advance('upgrades');
         }
         if (state.bootstrap === 'upgrades') {
             const priorities = [
@@ -3609,38 +3601,36 @@ SK.Scripts = class {
                             && sk.tasks.buyItem(button)) return false;
                 }
             }
-            return advance('stages');
+            return advance('housing');
         }
-        if (state.bootstrap === 'stages') {
-            if (this.model.minor.autoStageUpgrades) {
-                for (const name of ['pasture', 'aqueduct', 'amphitheatre', 'library']) {
-                    if (this.model.cathBuildings[name]) this.model.cathBuildings[name].enabled = true;
-                }
-                if (sk.tasks.autoUpgradeBonfireStages()) return false;
-            }
-            state.bootstrapRounds = 0;
-            return advance('production');
-        }
+        // Older in-progress saves may still be positioned at the removed stage.
+        if (state.bootstrap === 'stages') return advance('housing');
         if (state.bootstrap === 'production') {
-            const names = [
-                'workshop', 'pasture', 'aqueduct', 'mine', 'lumberMill',
-                'quarry', 'steamworks', 'magneto', 'reactor', 'smelter',
-                'calciner', 'accelerator', 'factory', 'observatory',
-                'academy', 'warehouse'
-            ];
-            let built = false;
-            for (let pass = 0; pass < 3 && state.bootstrapRounds < 24; ++pass) {
-                let round = false;
-                for (const name of names) {
-                    if (this.paragonFarmBootstrapBuy(name)) {
-                        round = true;
-                        built = true;
+            // A building which fails a purchase is removed from this bootstrap
+            // pass. Keep the surviving candidates across timer callbacks.
+            if (!Array.isArray(state.bootstrapProductionRemaining)) {
+                state.bootstrapProductionRemaining = [
+                    'mine', 'lumberMill', 'smelter', 'calciner',
+                    'steamworks', 'magneto', 'reactor', 'accelerator'
+                ];
+            }
+            // No lifetime cap: only limit purchases per callback to avoid
+            // freezing the browser when a reset carries huge resource stocks.
+            const maxPurchasesPerCall = 80;
+            let purchases = 0;
+            while (state.bootstrapProductionRemaining.length && purchases < maxPurchasesPerCall) {
+                const surviving = [];
+                for (const name of state.bootstrapProductionRemaining) {
+                    if (purchases >= maxPurchasesPerCall) {
+                        surviving.push(name);
+                    } else if (this.paragonFarmBootstrapBuy(name)) {
+                        surviving.push(name);
+                        purchases++;
                     }
                 }
-                state.bootstrapRounds += 1;
-                if (!round) break;
+                state.bootstrapProductionRemaining = surviving;
             }
-            if (built && state.bootstrapRounds < 24) return false;
+            if (state.bootstrapProductionRemaining.length) return false;
             return advance('done');
         }
         // Resume the regular cascading Auto Play profile on the next pass.
@@ -3651,23 +3641,18 @@ SK.Scripts = class {
         return false;
     }
 
-    // Trade incoming Elders for TC, but reserve resources for Chronospheres.
-    // No forced Elder trade is possible after reset preparation starts.
+    // Leviathans are rare: trade freely after Micro-Warp Reactors, even if
+    // Chronospheres / Flux Condensator still need Unobtainium. Stop at pre-reset.
     paragonFarmTradeElders(state) {
         if (!state.chronoRun || !this.model.minor.buildFiveChronospheres
-                || state.resetPrep || !game.workshop.get('eludiumHuts')?.researched) return false;
+                || state.resetPrep || !game.workshop.get('mWReactor')?.researched) return false;
         const elders = game.diplomacy.get('leviathans');
         if (!elders?.unlocked || !(elders.duration > 0)) return false;
         const unobtainium = game.resPool.get('unobtainium');
         const tradeVolume = game.diplomacy.getTradeVolume();
         const unitCost = elders.buys.find((price) => price.name === 'unobtainium')?.val * tradeVolume;
         if (!(unitCost > 0)) return false;
-        let reserve = game.workshop.get('fluxCondensator')?.researched ? 0 : 5000;
-        if (game.bld.get('chronosphere')?.val < 5) {
-            reserve += game.bld.getPrices('chronosphere')?.find((p) =>
-                p.name === 'unobtainium')?.val || 0;
-        }
-        const available = Math.floor(Math.max(0, unobtainium.value - reserve) / unitCost);
+        const available = Math.floor(unobtainium.value / unitCost);
         const trades = Math.min(100, available, game.diplomacy.getMaxTradeAmt(elders));
         if (trades > 0) {
             game.diplomacy.tradeMultiple(elders, trades);
