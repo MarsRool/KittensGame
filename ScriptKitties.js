@@ -580,7 +580,12 @@ SK.Tasks = class {
             ? ticks - 1 : this.lastScheduledTick;
         this.lastScheduledTick = ticks;
         for (const task of this.schedule) {
-            if (farmBusy && task.fn !== 'autoPlay' && task.fn !== 'autoSave') continue;
+            // Keep farmers adaptive while waiting to stockpile resources before reset.
+            // The bootstrap still disables all tasks except Auto Play and Auto Save.
+            const allowDuringReset = this.scripts.farmState?.resetPrep
+                && task.fn === 'autoAssign';
+            if (farmBusy && task.fn !== 'autoPlay' && task.fn !== 'autoSave'
+                    && !allowDuringReset) continue;
             // Run once when the scheduled tick was crossed, even if the browser
             // delayed our timer callback while this tab was in the background.
             const due = Math.floor((ticks - task.offset) / task.interval)
@@ -3868,8 +3873,10 @@ SK.Scripts = class {
     // Other automation remains disabled throughout this process.
     paragonFarmPrepareReset(state) {
         for (const name of Object.keys(this.model.auto)) {
-            if (name !== 'play') this.model.auto[name] = false;
+            if (name !== 'play' && name !== 'assign') this.model.auto[name] = false;
         }
+        // Only Auto Assign remains active alongside Auto Play during pre-reset.
+        this.model.auto.assign = true;
         // Disable action toggles without destroying numeric configuration
         // such as the festival party limit or saved resource preferences.
         const minorTasks = [
