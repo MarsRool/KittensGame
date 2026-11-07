@@ -3580,6 +3580,40 @@ SK.Scripts = class {
         return Boolean(button.model.enabled && button.model.visible && this.buyItem(button));
     }
 
+    // Optional upgrades use spare resources and never gate the finishing
+    // phase or reset. Skip upgrades that are already researched, unavailable
+    // or currently unaffordable, and buy at most one per pass.
+    paragonFarmBuyOptionalUpgrade() {
+        const required = ['mWReactor', 'unobtainiumHuts', 'eludiumHuts'];
+        if (!required.every((name) => game.workshop.get(name)?.researched)) return false;
+
+        const optional = [
+            'astrophysicists',
+            'storageBunkers',
+            'cryocomputing',
+            'coldFusion',
+            'hydroPlantTurbines',
+            'thinFilm',
+            'unobtainiumAxe',
+            'unobtainiumSaw'
+        ];
+        this.ensureContentExists('Workshop');
+        const buttons = game.workshopTab?.buttons || [];
+        for (const name of optional) {
+            const upgrade = game.workshop.get(name);
+            if (!upgrade || upgrade.researched || !upgrade.unlocked || upgrade.blocked) continue;
+            if ((upgrade.prices || []).some((price) =>
+                    this.model.exoticResources.includes(price.name))) continue;
+            const button = buttons.find((item) => item.model?.metadata?.name === name);
+            if (!button?.model) continue;
+            if (!button.model.visible) button.controller.updateVisible(button.model);
+            if (!button.model.enabled) button.controller.updateEnabled(button.model);
+            if (!button.model.visible || !button.model.enabled) continue;
+            if (this.buyItem(button)) return true;
+        }
+        return false;
+    }
+
     // Auto Play configures existing automation modules once per progression stage.
     // Manual changes remain effective until the next stage transition or reset.
     paragonFarmConfigure(stage, phase = 'normal') {
@@ -3724,9 +3758,13 @@ SK.Scripts = class {
             state.readyNotice = false;
             this.paragonFarmConfigure(stage, phase);
         }
-        // The regular Auto Workshop is off during this phase. Buy ONLY the
-        // three targeted upgrades in order; do not wait for every late upgrade.
-        if (phase === 'selective') this.paragonFarmBuyFocusedUpgrade();
+        // Mandatory upgrades are bought in strict order. Once all three
+        // are researched, optional upgrades can be purchased in both the
+        // selective and finishing phases without delaying the reset.
+        const boughtFocused = phase === 'selective' && this.paragonFarmBuyFocusedUpgrade();
+        if (!boughtFocused && (phase === 'selective' || phase === 'finish')) {
+            this.paragonFarmBuyOptionalUpgrade();
+        }
 
         if (stage === 'solar' && this.model.minor.autoFarmPolicies) {
             this.paragonFarmPolicies();
