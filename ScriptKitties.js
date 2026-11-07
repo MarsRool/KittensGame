@@ -1029,6 +1029,14 @@ SK.Tasks = class {
         if (this.model.auto.workshop) {
             candidates.push(...game.workshop.upgrades);
         }
+        // During focused Paragon farming, normal Auto Upgrade is disabled.
+        // Craft for the ONE selected upgrade anyway. Research is deliberately
+        // included only for the book chain, never for Steel/Alloy/Eludium.
+        if (this.model.auto.play && this.model.option.script === 'paragonFarm'
+                && this.farmState?.phase === 'selective') {
+            const target = this.paragonFarmPendingUpgrade();
+            if (target) candidates.push(target);
+        }
 
         const direct = Object.fromEntries(chain.map((name) => [name, 0]));
         let hasDemand = false;
@@ -1075,11 +1083,27 @@ SK.Tasks = class {
         const alloyGoals = this.model.option.coreAlloy === 'auto'
             ? this.autoCraftGoals(this.model.coreAlloys, false) : null;
         let ironCache = null;
+        const isFarm = this.model.auto.play && this.model.option.script === 'paragonFarm';
+        const isFinishing = isFarm && this.farmState?.phase === 'finish';
+        const focusedUpgrade = isFarm && this.farmState?.phase === 'selective'
+            ? this.paragonFarmPendingUpgrade()?.name : null;
 
         for (const craft of game.workshop.crafts) {
             const output = craft.name;
             const outRes = game.resPool.get(output);
             if (!craft.unlocked || outRes.type !== 'common') continue;
+
+            // Preserve Unobtainium for Unobtainium Huts, and stop wasting
+            // Alloy on Eludium after the targeted upgrades are complete.
+            if (isFarm && this.farmState?.phase === 'selective' && output === 'eludium'
+                    && focusedUpgrade !== 'mWReactor' && focusedUpgrade !== 'eludiumHuts') continue;
+
+            // In the finishing phase, reserve Steel and Alloy for Mansions and
+            // Space Stations. Steel -> Alloy is the only allowed metal chain.
+            if (isFinishing && output !== 'steel' && output !== 'alloy'
+                    && craft.prices.some((price) => price.name === 'steel' || price.name === 'alloy')) {
+                continue;
+            }
 
             // The Paragon farmer must never consume resources carried across resets.
             if (this.model.auto.play && this.model.option.script === 'paragonFarm' &&
@@ -1092,8 +1116,8 @@ SK.Tasks = class {
             const yieldPerCraft = Math.max(1, 1 + game.getResCraftRatio(output));
             const neededBatches = goals
                 ? Math.ceil(Math.max(0, goals.goals[output] - outRes.value) / yieldPerCraft)
-                : Infinity;
-            if (neededBatches === 0) continue;
+                : 0;
+            // Even when a goal is met, default crafting must continue.
 
             // Manual priority modes continue to work as before.
             if (selected !== 'default' && selected !== 'auto') {
@@ -1103,19 +1127,19 @@ SK.Tasks = class {
 
             let craftCount = Infinity;
             let minimumReserve = Infinity;
+            let goalCapacity = Infinity;
             for (const input of craft.prices) {
                 const inRes = game.resPool.get(input.name);
                 const inVal = inRes.value / input.val;
                 const outVal = outRes.value / yieldPerCraft;
                 craftCount = Math.min(craftCount, Math.floor(inVal));
 
-                if (goals) {
-                    // Keep material directly requested by another tech intact while
-                    // using only the extra amount for a higher-tier craft.
-                    const reserve = goals.direct[input.name] || 0;
-                    craftCount = Math.min(craftCount,
-                        Math.floor(Math.max(0, inRes.value - reserve) / input.val));
-                    continue;
+                if (goals && Object.prototype.hasOwnProperty.call(goals.direct, input.name)) {
+                    // Do not consume intermediates directly reserved by another
+                    // research or upgrade, even when default crafting is active.
+                    const reserve = goals.direct[input.name];
+                    goalCapacity = Math.min(goalCapacity,
+                        Math.max(0, Math.floor((inRes.value - reserve) / input.val)));
                 }
 
                 minimumReserve = Math.min(minimumReserve,
@@ -1149,11 +1173,27 @@ SK.Tasks = class {
                 }
             }
 
+            // 'auto' means default crafting PLUS enough extra batches to
+            // satisfy research / upgrade demand, never goals-only crafting.
+            craftCount = Math.max(craftCount, minimumReserve);
             if (goals) {
-                // Never exceed the demand implied by pending science/upgrades.
-                craftCount = Math.min(craftCount, neededBatches);
-            } else {
-                craftCount = Math.max(craftCount, minimumReserve);
+                craftCount = Math.min(goalCapacity, Math.max(craftCount, neededBatches));
+            }
+            // Keep the materials needed for the NEXT Mansion while
+            // converting spare Steel/Titanium into Alloy for Space Stations.
+            // Once Mansion is storage-capped, use both metals without reserve.
+            if (isFinishing && output === 'alloy') {
+                const mansionPrices = game.bld.getPrices('mansion') || [];
+                if (!this.paragonFarmIsPriceCapped(mansionPrices)) {
+                    for (const resourceName of ['steel', 'titanium']) {
+                        const ingredient = craft.prices.find((price) => price.name === resourceName);
+                        if (!ingredient) continue;
+                        const nextPrice = mansionPrices.find((price) => price.name === resourceName)?.val || 0;
+                        const available = game.resPool.get(resourceName).value - nextPrice;
+                        craftCount = Math.min(craftCount,
+                            Math.max(0, Math.floor(available / ingredient.val)));
+                    }
+                }
             }
             if (!(craftCount > 0) || !Number.isFinite(craftCount)) continue;
 
@@ -3508,9 +3548,41 @@ SK.Scripts = class {
         return false;
     }
 
+    // Focused upgrades start after space manufacturing and the first lunar
+    // outpost. Finish only after all three cost reductions / production upgrades
+    // and the new (post-upgrade) Hut and Log House storage caps.
+    paragonFarmLatePhase(solar) {
+        if (!solar || !game.workshop.get('spaceManufacturing')?.researched
+                || !(game.space.getBuilding('moonOutpost')?.val > 0)) return 'normal';
+        const upgradesDone = ['mWReactor', 'unobtainiumHuts', 'eludiumHuts']
+            .every((name) => game.workshop.get(name)?.researched);
+        const housesCapped = ['hut', 'logHouse']
+            .every((name) => game.bld.get(name)?.unlocked
+                && this.paragonFarmIsPriceCapped(game.bld.getPrices(name)));
+        return upgradesDone && housesCapped ? 'finish' : 'selective';
+    }
+
+    paragonFarmPendingUpgrade() {
+        return ['mWReactor', 'unobtainiumHuts', 'eludiumHuts']
+            .map((name) => game.workshop.get(name))
+            .find((upgrade) => upgrade && !upgrade.researched) || null;
+    }
+
+    paragonFarmBuyFocusedUpgrade() {
+        const upgrade = this.paragonFarmPendingUpgrade();
+        if (!upgrade?.unlocked || upgrade.blocked) return false;
+        this.ensureContentExists('Workshop');
+        const button = game.workshopTab?.buttons?.find((item) =>
+            item.model?.metadata?.name === upgrade.name);
+        if (!button?.model) return false;
+        if (!button.model.enabled) button.controller.updateEnabled(button.model);
+        if (!button.model.visible) button.controller.updateVisible(button.model);
+        return Boolean(button.model.enabled && button.model.visible && this.buyItem(button));
+    }
+
     // Auto Play configures existing automation modules once per progression stage.
     // Manual changes remain effective until the next stage transition or reset.
-    paragonFarmConfigure(stage) {
+    paragonFarmConfigure(stage, phase = 'normal') {
         const protectedResources = [
             'timeCrystal', 'relic', 'void', 'antimatter',
             'blackcoin', 'bloodstone', 'necrocorn', 'sorrow',
@@ -3524,7 +3596,8 @@ SK.Scripts = class {
 
         Object.assign(this.model.auto, {
             build: true, craft: true, hunt: true, party: true,
-            explore: true, research: true, workshop: true, assign: true,
+            explore: true, research: phase !== 'finish',
+            workshop: phase === 'normal', assign: true,
             // The only scripted religion purchase before Solar Revolution is
             // Solar Revolution itself, so Faith and Gold can accumulate.
             religion: true, praise: stage === 'solar',
@@ -3536,10 +3609,11 @@ SK.Scripts = class {
             program: false, autoFixCC: false, praiseAfter: false,
             observe: true, promote: stage === 'solar',
             promoteKittens: stage === 'solar', autoFarmPolicies: true,
-            autoStageUpgrades: true
+            autoStageUpgrades: phase !== 'finish'
         });
         Object.assign(this.model.option, {
-            assign: 'smart', book: 'auto', coreAlloy: 'auto'
+            assign: 'smart', book: 'auto',
+            coreAlloy: phase === 'finish' ? 'alloy' : 'auto'
         });
         game.time.isAccelerated = false;
 
@@ -3552,7 +3626,9 @@ SK.Scripts = class {
             const prices = game.bld.getPrices(name) || building?.prices || [];
             config.enabled = Boolean(building)
                 && !prices.some((price) => this.model.exoticResources.includes(price.name)
-                    || (stage === 'theology' && name !== 'temple' && price.name === 'gold'));
+                    || (stage === 'theology' && name !== 'temple' && price.name === 'gold')
+                    || (phase === 'finish' && name !== 'mansion'
+                        && (price.name === 'steel' || price.name === 'alloy')));
         }
 
         // Farm Starcharts using Research Vessels on Piscine.
@@ -3563,7 +3639,11 @@ SK.Scripts = class {
         ]);
         for (const [name, config] of Object.entries(this.model.spaceBuildings)) {
             delete config.limit;
-            config.enabled = allowedSpaceBuildings.has(name);
+            const building = game.space.getBuilding(name);
+            config.enabled = allowedSpaceBuildings.has(name)
+                && !(phase === 'finish' && name !== 'spaceStation'
+                    && building?.prices?.some((price) =>
+                        price.name === 'steel' || price.name === 'alloy'));
         }
         for (const config of Object.values(this.model.timeBuildings)) {
             config.enabled = false;
@@ -3628,16 +3708,25 @@ SK.Scripts = class {
         const theology = Boolean(game.science.get('theology')?.researched);
         const solar = Boolean(game.religion.getRU('solarRevolution')?.on);
         const stage = solar ? 'solar' : theology ? 'theology' : 'early';
-        // Apply this updated profile once on existing saves, not every tick.
-        if (state.stage !== stage || state.farmProfileVersion !== 5
-                || state.spaceProfileVersion !== 2) {
-            state.farmProfileVersion = 5;
+        // Finishing stays active even if a new Warehouse temporarily raises
+        // the caps again. The actual reset still checks ALL four housing caps.
+        const phase = solar && state.phase === 'finish'
+            ? 'finish' : this.paragonFarmLatePhase(solar);
+        // Apply changes on progression transitions, not every tick. The
+        // version also migrates previously active Safe Paragon Farm runs.
+        if (state.stage !== stage || state.phase !== phase
+                || state.farmProfileVersion !== 6 || state.spaceProfileVersion !== 2) {
+            state.farmProfileVersion = 6;
             state.spaceProfileVersion = 2;
             state.stage = stage;
+            state.phase = phase;
             state.cappedSince = null;
             state.readyNotice = false;
-            this.paragonFarmConfigure(stage);
+            this.paragonFarmConfigure(stage, phase);
         }
+        // The regular Auto Workshop is off during this phase. Buy ONLY the
+        // three targeted upgrades in order; do not wait for every late upgrade.
+        if (phase === 'selective') this.paragonFarmBuyFocusedUpgrade();
 
         if (stage === 'solar' && this.model.minor.autoFarmPolicies) {
             this.paragonFarmPolicies();
